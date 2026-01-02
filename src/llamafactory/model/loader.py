@@ -53,11 +53,32 @@ class TokenizerModule(TypedDict):
     processor: Optional["ProcessorMixin"]
 
 
+def _maybe_set_hf_cache_env(cache_dir: str | None) -> None:
+    """Redirect Hugging Face caches to a writable location.
+
+    Some parts of the HF stack (e.g., negative-cache metadata) may still try to
+    write under the default `~/.cache/huggingface` even when `cache_dir` is
+    passed to `from_pretrained`. If that default directory is not writable
+    (common on shared machines), model processor loading can fail.
+    """
+    if not cache_dir:
+        return
+
+    cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ.setdefault("HF_HUB_CACHE", cache_dir)
+    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", cache_dir)
+    os.environ.setdefault("TRANSFORMERS_CACHE", cache_dir)
+    os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(cache_dir, "datasets"))
+    os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
+
+
 def _get_init_kwargs(model_args: "ModelArguments") -> dict[str, Any]:
     r"""Get arguments to load config/tokenizer/model.
 
     Note: including inplace operation of model_args.
     """
+    _maybe_set_hf_cache_env(model_args.cache_dir)
     skip_check_imports()
     model_args.model_name_or_path = try_download_model_from_other_hub(model_args)
     return {
