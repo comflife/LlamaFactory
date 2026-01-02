@@ -18,7 +18,7 @@ We generate ShareGPT (LLaMAFactory) multimodal samples like:
       {"role": "user", "content": "<image>\n..."},
       {"role": "assistant", "content": "...\n<trajectory>\n[x,y,z],[x,y,z],..."}
     ],
-    "images": ["training/<seq>/gt_image/<ts>_fillcolor.png"],
+        "images": ["training/<seq>/image_data/<ts>.png"],
     "meta": {"split": "training", "sequence": "...", "timestamp": "..."}
   }
 
@@ -32,7 +32,7 @@ Use --write-dataset-info to auto-generate a minimal dataset_info.json next to th
 python3 scripts/orad3d_build_vlm_sharegpt.py \
   --orad-root /data3/ORAD-3D \
   --splits training \
-  --image-folder gt_image \
+    --image-folder image_data \
   --trajectory-key trajectory_ins \
   --num-points 4 \
   --relative-media \
@@ -258,7 +258,7 @@ def main() -> int:
     ap.add_argument("--out", required=True, help="Output JSONL path")
     ap.add_argument(
         "--image-folder",
-        default="gt_image",
+        default="image_data",
         choices=["gt_image", "image_data"],
         help="Which image folder to use as the VLM input",
     )
