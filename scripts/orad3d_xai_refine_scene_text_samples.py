@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Refine ORAD-3D scene text using xAI API (OpenAI SDK version)."""
 
+"""
+python scripts/orad3d_xai_refine_scene_text_samples.py --model grok-4-1-fast-reasoning --num-samples 20
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -9,6 +13,7 @@ import json
 import os
 import random
 import time
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -124,11 +129,13 @@ def build_prompt(original_text: str) -> Tuple[str, str]:
         "You must be factual and avoid speculation."
     )
     user = (
-        "I am about to drive autonomously using this front-facing camera image. "
-        "Please verify whether the following language description correctly matches the scene. "
-        "If it is incorrect, rewrite it to be accurate. "
-        "Keep it concise and in English. "
-        "Return only the corrected description (no extra commentary).\n\n"
+        "You are an expert off-road autonomous driving AI generating Chain-of-Causation (CoC) reasoning for trajectory planning. "
+        "Analyze this front-facing camera image for off-road terrain navigation. "
+        "Focus on traversable areas, obstacles, slopes, gaps. "
+        "Output ONLY in this exact format (English, concise):\n"
+        "Decision: [explicit driving action, e.g., 'steer left around rock', 'accelerate through flat gap', 'slow climb steep slope']\n"
+        "because [core visual cause, e.g., 'narrow traversable gap left']\n"
+        "as [short causal chain, e.g., 'right blocked by boulders → left gap safer traction → gentle curve trajectory'].\n\n"
         f"Original description:\n{original_text}"
     )
     return system, user
@@ -142,6 +149,11 @@ def render_text_panel(
     original_text: str,
     refined_text: str,
 ) -> Image.Image:
+    # Normalize text to ASCII to avoid Unicode encoding issues with PIL
+    header = unicodedata.normalize('NFKD', header).encode('ascii', 'ignore').decode('ascii')
+    original_text = unicodedata.normalize('NFKD', original_text).encode('ascii', 'ignore').decode('ascii')
+    refined_text = unicodedata.normalize('NFKD', refined_text).encode('ascii', 'ignore').decode('ascii')
+    
     img = Image.new("RGB", (width, height), (255, 255, 255))
     draw = ImageDraw.Draw(img)
     font = ImageFont.load_default()
