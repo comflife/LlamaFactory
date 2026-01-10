@@ -66,11 +66,68 @@ def _maybe_set_hf_cache_env(cache_dir: str | None) -> None:
 
     cache_dir = os.path.abspath(os.path.expanduser(cache_dir))
     os.makedirs(cache_dir, exist_ok=True)
-    os.environ.setdefault("HF_HUB_CACHE", cache_dir)
-    os.environ.setdefault("HUGGINGFACE_HUB_CACHE", cache_dir)
-    os.environ.setdefault("TRANSFORMERS_CACHE", cache_dir)
-    os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(cache_dir, "datasets"))
+
+    def _ensure_env_dir(var_name: str, value: str) -> None:
+        """Set cache env var, but only override if current value is not writable.
+
+        Some environments predefine HF cache env vars to a shared, root-owned
+        location. In that case, passing `cache_dir` alone may not be enough.
+        """
+
+        current = os.environ.get(var_name)
+        if current:
+            current = os.path.abspath(os.path.expanduser(current))
+            try:
+                os.makedirs(current, exist_ok=True)
+                if os.access(current, os.W_OK):
+                    return
+            except Exception:
+                pass
+        os.environ[var_name] = value
+
+    hub_cache = os.path.join(cache_dir, "hub")
+    datasets_cache = os.path.join(cache_dir, "datasets")
+
+    # Make huggingface_hub default caches land under a writable root.
+    _ensure_env_dir("HF_HOME", cache_dir)
+    _ensure_env_dir("HF_HUB_CACHE", hub_cache)
+    _ensure_env_dir("HUGGINGFACE_HUB_CACHE", hub_cache)
+
+    # Keep transformers and datasets caches consistent.
+    _ensure_env_dir("TRANSFORMERS_CACHE", cache_dir)
+    _ensure_env_dir("HF_DATASETS_CACHE", datasets_cache)
     os.makedirs(os.environ["HF_DATASETS_CACHE"], exist_ok=True)
+
+    # Some libraries cache these paths at import time, so update their module
+    # constants as well to ensure runtime redirection is effective.
+    try:
+        import huggingface_hub.constants as _hub_constants  # type: ignore
+
+        for key in ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+            if hasattr(_hub_constants, key) and key in os.environ:
+                setattr(_hub_constants, key, os.environ[key])
+    except Exception:
+        pass
+
+    try:
+        from transformers.utils import hub as _tf_hub  # type: ignore
+
+        if hasattr(_tf_hub, "TRANSFORMERS_CACHE") and "TRANSFORMERS_CACHE" in os.environ:
+            _tf_hub.TRANSFORMERS_CACHE = os.environ["TRANSFORMERS_CACHE"]
+        if hasattr(_tf_hub, "HF_MODULES_CACHE") and "HF_HOME" in os.environ:
+            # Keep custom module cache under HF_HOME to avoid writing to ~/.cache.
+            _tf_hub.HF_MODULES_CACHE = os.path.join(os.environ["HF_HOME"], "modules")
+            os.makedirs(_tf_hub.HF_MODULES_CACHE, exist_ok=True)
+    except Exception:
+        pass
+
+    try:
+        import datasets.config as _ds_config  # type: ignore
+
+        if hasattr(_ds_config, "HF_DATASETS_CACHE") and "HF_DATASETS_CACHE" in os.environ:
+            _ds_config.HF_DATASETS_CACHE = os.environ["HF_DATASETS_CACHE"]
+    except Exception:
+        pass
 
 
 def _get_init_kwargs(model_args: "ModelArguments") -> dict[str, Any]:

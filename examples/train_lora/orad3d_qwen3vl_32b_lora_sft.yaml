@@ -1,6 +1,6 @@
 ### model
 # If you have a local path, replace with your local checkpoint directory.
-model_name_or_path: Qwen/Qwen3-VL-2B-Instruct
+model_name_or_path: Qwen/Qwen3-VL-32B-Instruct
 trust_remote_code: true
 
 # Use a writable Hugging Face cache directory (avoids permission issues if ~/.cache/huggingface is root-owned).
@@ -32,12 +32,12 @@ media_dir: /data3/ORAD-3D
 
 # Qwen3-VL template; nothink is usually preferred for SFT
 template: qwen3_vl_nothink
-cutoff_len: 12288
+cutoff_len: 4096
 preprocessing_num_workers: 16
 dataloader_num_workers: 4
 
 ### output
-output_dir: saves/orad3d/qwen3-vl-2b/lora/sft
+output_dir: saves/orad3d/qwen3-vl-32b/lora/sft
 logging_steps: 10
 save_strategy: epoch
 plot_loss: true
@@ -46,7 +46,7 @@ save_only_model: false
 report_to: none
 
 ### train
-per_device_train_batch_size: 8
+per_device_train_batch_size: 32
 gradient_accumulation_steps: 8
 learning_rate: 1.0e-5
 num_train_epochs: 3.0

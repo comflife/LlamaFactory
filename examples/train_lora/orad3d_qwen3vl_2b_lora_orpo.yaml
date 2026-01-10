@@ -15,19 +15,23 @@ video_max_pixels: 16384
 add_special_tokens: "<trajectory>"
 
 ### method
-stage: sft
+stage: dpo
 do_train: true
 finetuning_type: lora
-lora_rank: 8
+lora_rank: 32
 lora_target: all
+pref_beta: 0.1
+pref_loss: orpo  # choices: [sigmoid (dpo), orpo, simpo]
 
 ### dataset
-# Uses ShareGPT multimodal format written by scripts/orad3d_build_vlm_sharegpt.py
+# Uses ORPO/DPO-style ranking format written by scripts/orad3d_build_vlm_orpo.py (--orpo)
 # dataset_info.json must exist under dataset_dir.
-dataset: orad3d_vlm
+dataset: orad3d_orpo
 
-# Use the repo dataset registry (data/dataset_info.json). The dataset file itself can live elsewhere.
-dataset_dir: ./data
+# Point this to the folder that contains both:
+#   - dataset_info.json
+#   - your generated *_training_orpo.jsonl
+dataset_dir: /data3/orad3d_orpo
 media_dir: /data3/ORAD-3D
 
 # Qwen3-VL template; nothink is usually preferred for SFT
@@ -37,7 +41,7 @@ preprocessing_num_workers: 16
 dataloader_num_workers: 4
 
 ### output
-output_dir: saves/orad3d/qwen3-vl-2b/lora/sft
+output_dir: /data3/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo
 logging_steps: 10
 save_strategy: epoch
 plot_loss: true
@@ -46,10 +50,10 @@ save_only_model: false
 report_to: none
 
 ### train
-per_device_train_batch_size: 8
+per_device_train_batch_size: 2
 gradient_accumulation_steps: 8
-learning_rate: 1.0e-5
-num_train_epochs: 3.0
+learning_rate: 5.0e-6
+num_train_epochs: 10.0
 lr_scheduler_type: cosine
 warmup_ratio: 0.1
 bf16: true
