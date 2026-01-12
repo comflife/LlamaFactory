@@ -38,6 +38,23 @@
       "assistant_tag": "assistant"
     }
   },
+  "orad3d_vlm": {
+    "file_name": "/data3/orad3d_vlm/orad3d_all.jsonl",
+    "formatting": "sharegpt",
+    "columns": {
+      "messages": "messages",
+      "images": "images"
+    },
+    "tags": {
+      "role_tag": "role",
+      "content_tag": "content",
+      "user_tag": "user",
+      "assistant_tag": "assistant",
+      "system_tag": "system",
+      "observation_tag": "observation",
+      "function_tag": "function_call"
+    }
+  },
   "mllm_audio_demo": {
     "file_name": "mllm_audio_demo.json",
     "formatting": "sharegpt",
