@@ -9,4 +9,4 @@ export CUDA_CACHE_PATH=/home/byounggun/.cache/nv/ComputeCache
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 llamafactory-cli train examples/train_lora/orad3d_qwen3vl_32b_lora_sft.yaml
 CUDA_VISIBLE_DEVICES=4,5,6,7 llamafactory-cli train examples/train_lora/orad3d_qwen3vl_2b_lora_sft.yaml
-CUDA_VISIBLE_DEVICES=4,5,6,7 llamafactory-cli train examples/train_lora/orad3d_qwen3vl_2b_lora_orpo.yaml
+llamafactory-cli train examples/train_lora/orad3d_qwen3vl_2b_lora_orpo.yaml

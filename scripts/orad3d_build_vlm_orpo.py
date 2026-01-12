@@ -44,20 +44,20 @@ Example (ORPO pairwise dataset for training split; SBERT text similarity + XY tr
         --splits training \
         --image-folder image_data \
         --trajectory-key trajectory_ins \
-        --num-points 0 \
+        --num-points 8 \
         --relative-media \
         --media-root /data3/ORAD-3D \
         --orpo \
-        --out /data3/orad3d_orpo/orad3d_train_orpo.jsonl \
+        --out /data3/orad3d_orpo2/orad3d_train_orpo.jsonl \
         --write-dataset-info \
-        --dataset-name orad3d_orpo \
+        --dataset-name orad3d_orpo2 \
         --text-sim-backend sbert \
         --sbert-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 \
-        --sbert-device cpu \
+        --sbert-device cuda \
         --min-text-similarity 0.35 \
         --max-traj-similarity 0.45 \
         --train-exclude-bottom-quantile 0.25 \
-        --wrong-pool-size 256 \
+        --wrong-pool-size 1024 \
         --seed 0
 
 Notes:
