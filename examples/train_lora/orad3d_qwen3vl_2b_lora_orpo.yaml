@@ -4,7 +4,7 @@ model_name_or_path: Qwen/Qwen3-VL-2B-Instruct
 trust_remote_code: true
 
 # Use a writable Hugging Face cache directory (avoids permission issues if ~/.cache/huggingface is root-owned).
-cache_dir: /home/byounggun/.cache/hf
+cache_dir: /home/work/byounggun/.cache/hf
 
 # Qwen3-VL processor settings (keep consistent with Qwen examples)
 image_max_pixels: 262144
@@ -31,13 +31,13 @@ dataset: orad3d_orpo2
 # Point this to the folder that contains both:
 #   - dataset_info.json
 #   - your generated *_training_orpo.jsonl
-dataset_dir: /data3/orad3d_orpo2
-media_dir: /data3/ORAD-3D
+dataset_dir: ./data
+media_dir: /home/work/datasets/bg/ORAD-3D
 
 # Qwen3-VL template; nothink is usually preferred for SFT
 template: qwen3_vl_nothink
-cutoff_len: 24576
-preprocessing_num_workers: 16
+cutoff_len: 12288
+preprocessing_num_workers: 4
 dataloader_num_workers: 4
 
 ### output
@@ -50,7 +50,7 @@ save_only_model: false
 report_to: none
 
 ### train
-per_device_train_batch_size: 4
+per_device_train_batch_size: 16
 gradient_accumulation_steps: 8
 learning_rate: 1.0e-4
 num_train_epochs: 10.0

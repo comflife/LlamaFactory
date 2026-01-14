@@ -166,7 +166,7 @@ def _iter_scene_pairs(
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Refine ORAD-3D scene text and save into scene_data_refine.")
-    ap.add_argument("--orad-root", type=Path, default=Path("/data3/ORAD-3D"))
+    ap.add_argument("--orad-root", type=Path, default=Path("/home/work/datasets/bg/ORAD-3D"))
     ap.add_argument(
         "--splits",
         type=str,
@@ -241,6 +241,13 @@ def main() -> int:
                     total_skipped += 1
                     continue
 
+                if img_path is None:
+                    total_skipped += 1
+                    print(
+                        f"[SKIP] missing image for {split}/{seq_dir.name}/{ts} (image_folder={args.image_folder})"
+                    )
+                    continue
+
                 original = _read_text(scene_path)
                 refined = original
 
@@ -250,10 +257,6 @@ def main() -> int:
                     else:
                         if client is None:
                             raise RuntimeError("Client not initialized.")
-                        if img_path is None:
-                            raise RuntimeError(
-                                f"Missing image for {split}/{seq_dir.name}/{ts} (image_folder={args.image_folder})"
-                            )
 
                         system, user = build_prompt(original)
                         data_url = _encode_image_as_data_url(img_path)

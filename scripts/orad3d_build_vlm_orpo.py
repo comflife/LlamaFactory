@@ -1,59 +1,19 @@
 #!/usr/bin/env python3
 """Build multimodal preference datasets (ORPO/DPO-style or KTO-style) for LLaMAFactory VLM fine-tuning.
 
-This script scans ORAD-3D extracted folders and emits JSONL examples compatible with LLaMAFactory's
-"sharegpt" converter.
+python3 scripts/orad3d_build_vlm_orpo.py \
+  --orad-root /home/work/datasets/bg/ORAD-3D \
+  --splits training validation \
+  --image-folder image_data \
+  --trajectory-key trajectory_ins \
+  --num-points 8 \
+  --relative-media \
+  --media-root /home/work/datasets/bg/ORAD-3D \
+  --orpo \
+  --out /home/work/datasets/bg/orad3d_orpo2/orad3d_train_orpo.jsonl \
+  --write-dataset-info \
+  --dataset-name orad3d_orpo2
 
-Supported preference formats:
-
-- ORPO/DPO-style ranking (--orpo): one example contains:
-
-    - messages: prompt turns (system + user)
-    - chosen: a better assistant message
-    - rejected: a worse assistant message
-    - images: image paths aligned with <image> tokens
-
-    This matches LLaMAFactory "preference dataset" (ranking=true) expected schema.
-
-- KTO-style boolean feedback (--kto): emits one example per completion with boolean `kto_tag`.
-
-Hard negatives are sampled from other frames.
-
-Note: for rejected/false examples we keep the *prompt* (image + user text) fixed, and only corrupt
-the trajectory. The scene description stays anchored to the prompt frame to avoid mismatching the
-image with an unrelated textual scene description.
-
-You can enforce *both*:
-- language similarity: the wrong frame scene_text must be similar to the positive frame scene_text,
-  to avoid pulling an unrelated scene.
-- trajectory dissimilarity: the wrong frame XY trajectory must be sufficiently different.
-
-We compute language similarity with a lightweight bag-of-words cosine (no external model) and compute
-trajectory similarity in XY only (ignore z) using delta-cosine + heading similarity.
-
-Example (ORPO pairwise dataset for training split; SBERT text similarity + XY trajectory dissimilarity):
-
-    # If you use SBERT backend:
-    #   pip install sentence-transformers
-    #
-    # This writes:
-    #   - /data3/orad3d_orpo/orad3d_train_orpo.jsonl
-    #   - /data3/orad3d_orpo/dataset_info.json (required by LLaMAFactory)
-    #   - /data3/orad3d_orpo/dataset_info_orpo.json (alias for convenience)
-    python3 scripts/orad3d_build_vlm_orpo.py \
-  --orad-root /home/work/datasets/bg/ORAD-3D --splits training \
-  --image-folder image_data --trajectory-key trajectory_ins --num-points 8 \
-  --relative-media --media-root /home/work/datasets/bg/ORAD-3D \
-  --orpo --out /home/work/datasets/bg/orad3d_orpo2/orad3d_train_orpo.jsonl \
-  --write-dataset-info --dataset-name orad3d_orpo2 \
-  --negative-source hybrid --negative-policy hard --seq-window 10 \
-  --min-text-similarity 0.35 --max-traj-similarity 0.45 \
-  --train-exclude-bottom-quantile 0.25 --wrong-pool-size 1024 --seed 0
-
-
-Notes:
-- <trajectory> is treated as a special token in LLaMAFactory via training config (e.g., add_special_tokens: "<trajectory>").
-- If negative sampling becomes too strict (many frames skipped), relax thresholds or increase --wrong-pool-size.
 """
 
 from __future__ import annotations
@@ -121,10 +81,11 @@ class BuildOptions:
     # Thresholded negative selection.
     min_text_similarity: float | None
     max_traj_similarity: float | None
-    negative_policy: Literal["most_different", "hard"]
+    negative_policy: Literal["most_different", "hard", "z_diff"]
     negative_source: Literal["same_sequence", "global_pool", "hybrid"]
     seq_window: int
     allow_negative_fallback: bool
+    min_z_diff: float | None
 
     # Text similarity backend.
     text_sim_backend: Literal["bow", "sbert"]
@@ -322,6 +283,43 @@ def _quantile(values: list[float], q: float) -> float:
     return float(sorted_vals[idx])
 
 
+def _trajectory_z_diff(
+    points_a: list[list[float]],
+    points_b: list[list[float]],
+    num_points: int,
+) -> float | None:
+    """Return mean absolute z difference over aligned trajectory points."""
+    if not points_a or not points_b:
+        return None
+
+    if num_points > 0:
+        chosen_a = _choose_points(points_a, num_points)
+        chosen_b = _choose_points(points_b, num_points)
+    else:
+        chosen_a = points_a
+        chosen_b = points_b
+
+    if not chosen_a or not chosen_b:
+        return None
+
+    if len(chosen_a) != len(chosen_b):
+        n = min(len(chosen_a), len(chosen_b))
+        if n <= 0:
+            return None
+        chosen_a = _choose_points(points_a, n)
+        chosen_b = _choose_points(points_b, n)
+
+    diffs: list[float] = []
+    for pa, pb in zip(chosen_a, chosen_b):
+        if not isinstance(pa, list) or not isinstance(pb, list) or len(pa) < 3 or len(pb) < 3:
+            continue
+        diffs.append(abs(float(pa[2]) - float(pb[2])))
+
+    if not diffs:
+        return None
+    return float(sum(diffs) / len(diffs))
+
+
 def _text_tokens(text: str) -> list[str]:
     # Keep it lightweight and unicode-friendly (\w includes many unicode word chars).
     return [t for t in re.findall(r"\w+", text.lower()) if t]
@@ -492,7 +490,7 @@ def _collect_trajectory_pool(opt: BuildOptions) -> List[Tuple[Tuple[str, str, st
                 except Exception:
                     continue
 
-                if len(points) == 0:
+                if len(points) < 2:
                     continue
 
                 if not scene_text:
@@ -546,7 +544,7 @@ def _collect_sequence_items(seq_dir: Path, split: str, opt: BuildOptions) -> lis
         except Exception:
             continue
 
-        if not points or not scene_text:
+        if len(points) < 2 or not scene_text:
             continue
 
         try:
@@ -571,6 +569,32 @@ def _choose_negative_from_candidates(
     if not candidates:
         return None, None, None
 
+    if opt.negative_policy == "z_diff":
+        scored: list[tuple[float, Tuple[str, str, str], list[list[float]], str]] = []
+        for wrong_key, wrong_raw_points, wrong_scene_text in candidates:
+            if wrong_key == current_key:
+                continue
+            z_diff = _trajectory_z_diff(correct_points, wrong_raw_points, opt.num_points)
+            if z_diff is None:
+                continue
+            scored.append((z_diff, wrong_key, wrong_raw_points, wrong_scene_text))
+
+        scored.sort(key=lambda t: -t[0])  # maximize z difference
+
+        tries = max(1, int(opt.max_negative_tries))
+        for z_diff, wrong_key, wrong_raw_points, wrong_scene_text in scored[: min(tries, len(scored))]:
+            if opt.min_z_diff is not None and float(z_diff) < float(opt.min_z_diff):
+                continue
+            if not wrong_scene_text:
+                continue
+            return wrong_key, wrong_raw_points, wrong_scene_text
+
+        if bool(opt.allow_negative_fallback) and scored:
+            _, wrong_key, wrong_raw_points, wrong_scene_text = scored[0]
+            return wrong_key, wrong_raw_points, wrong_scene_text
+
+        return None, None, None
+
     correct_xy = _normalize_xy(_to_xy(_choose_points(correct_points, opt.num_points)))
     correct_heading = _heading_angle_rad(correct_xy)
 
@@ -586,6 +610,7 @@ def _choose_negative_from_candidates(
     # NOTE: `traj_sim` is in [0, 1]. Higher => more similar.
     # - most_different: pick the least similar trajectory (diverse negative).
     # - hard: pick the most similar trajectory that still passes the thresholds (hard negative).
+    # - z_diff is handled earlier (maximize mean absolute z difference).
     if opt.negative_policy == "hard":
         scored.sort(key=lambda t: (-t[0], -t[1]))  # maximize traj_sim, then text_sim
     else:
@@ -724,7 +749,7 @@ def _iter_frame_samples(
         except Exception:
             continue
 
-        if len(correct_points) == 0:
+        if len(correct_points) < 2:
             continue
 
         current_key = (*current_key_base, ts)
@@ -767,11 +792,18 @@ def _iter_frame_samples(
 
             # Best-effort: hard negatives from the same sequence/time neighborhood.
             if seq_items is not None and seq_pos_by_ts is not None:
-                pos = seq_pos_by_ts.get(ts)
-                if pos is not None and opt.seq_window > 0:
-                    lo = max(0, int(pos) - int(opt.seq_window))
-                    hi = min(len(seq_items), int(pos) + int(opt.seq_window) + 1)
-                    local_candidates = [(it.key, it.points, it.scene_text) for it in seq_items[lo:hi] if it.key != current_key]
+                if opt.negative_policy == "z_diff":
+                    local_candidates = [(it.key, it.points, it.scene_text) for it in seq_items if it.key != current_key]
+                else:
+                    pos = seq_pos_by_ts.get(ts)
+                    if pos is None or opt.seq_window <= 0:
+                        local_candidates = []
+                    else:
+                        lo = max(0, int(pos) - int(opt.seq_window))
+                        hi = min(len(seq_items), int(pos) + int(opt.seq_window) + 1)
+                        local_candidates = [(it.key, it.points, it.scene_text) for it in seq_items[lo:hi] if it.key != current_key]
+
+                if local_candidates:
                     wrong_key, wrong_raw_points, wrong_scene_text = _choose_negative_from_candidates(
                         current_key=current_key,
                         correct_points=correct_points,
@@ -803,8 +835,14 @@ def _iter_frame_samples(
 
             # Add debug similarities (helps verify thresholds).
             wrong_xy_norm = _normalize_xy(_to_xy(_choose_points(wrong_raw_points, opt.num_points)))
-            traj_sim = _trajectory_similarity_xy(_normalize_xy(_to_xy(_choose_points(correct_points, opt.num_points))), wrong_xy_norm)
-            text_sim = _TEXT_SIM.similarity01(scene_text, wrong_scene_text)  # type: ignore[union-attr]
+            traj_sim = _trajectory_similarity_xy(
+                _normalize_xy(_to_xy(_choose_points(correct_points, opt.num_points))),
+                wrong_xy_norm,
+            )
+            text_sim = None
+            if opt.negative_policy != "z_diff":
+                text_sim = _TEXT_SIM.similarity01(scene_text, wrong_scene_text)  # type: ignore[union-attr]
+            z_diff = _trajectory_z_diff(correct_points, wrong_raw_points, opt.num_points)
 
             # ORPO/DPO-style preference example: prompt messages end with user (odd turns),
             # chosen/rejected are assistant messages.
@@ -818,8 +856,9 @@ def _iter_frame_samples(
                     "sequence": seq_dir.name,
                     "timestamp": ts,
                     "negative_from": {"split": wrong_key[0], "sequence": wrong_key[1], "timestamp": wrong_key[2]},
-                    "neg_text_sim": round(float(text_sim), 6),
+                    "neg_text_sim": round(float(text_sim), 6) if text_sim is not None else None,
                     "neg_traj_sim": round(float(traj_sim), 6),
+                    "neg_z_diff": round(float(z_diff), 6) if z_diff is not None else None,
                 },
             }
             yield sample
@@ -1025,26 +1064,32 @@ def main() -> int:
     )
     ap.add_argument(
         "--negative-policy",
-        choices=["most_different", "hard"],
-        default="most_different",
-        help="How to pick the negative among candidates that pass thresholds.",
+        choices=["most_different", "hard", "z_diff"],
+        default="z_diff",
+        help="How to pick the negative among candidates (z_diff selects by max mean |z| difference).",
     )
     ap.add_argument(
         "--negative-source",
         choices=["same_sequence", "global_pool", "hybrid"],
-        default="hybrid",
-        help="Where to sample negatives from (same sequence is typically strongest).",
+        default="same_sequence",
+        help="Where to sample negatives from (same sequence is the scene-local default).",
     )
     ap.add_argument(
         "--seq-window",
         type=int,
         default=10,
-        help="When using same_sequence/hybrid, sample negatives from +/- this many neighboring frames.",
+        help="When using same_sequence/hybrid, sample negatives from +/- this many neighboring frames (ignored for z_diff).",
     )
     ap.add_argument(
         "--allow-negative-fallback",
         action="store_true",
         help="If no negative satisfies constraints, fall back to the best available candidate instead of skipping.",
+    )
+    ap.add_argument(
+        "--min-z-diff",
+        type=float,
+        default=None,
+        help="Minimum mean absolute z difference required when using --negative-policy z_diff.",
     )
 
     ap.add_argument(
@@ -1126,6 +1171,7 @@ def main() -> int:
         negative_source=str(args.negative_source),
         seq_window=int(args.seq_window),
         allow_negative_fallback=bool(args.allow_negative_fallback),
+        min_z_diff=float(args.min_z_diff) if args.min_z_diff is not None else None,
         text_sim_backend=args.text_sim_backend,
         sbert_model=str(args.sbert_model),
         sbert_device=str(args.sbert_device),
