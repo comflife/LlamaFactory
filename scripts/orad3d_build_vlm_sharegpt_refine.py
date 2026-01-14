@@ -7,7 +7,7 @@ This script is designed to work while extraction is still in progress:
 
 ORAD-3D expected layout (after unpack):
   /data3/ORAD-3D/
-    training/<seq>/{gt_image,image_data,scene_data,local_path}/...
+    training/<seq>/{gt_image,image_data,scene_data_refine,local_path}/...
     validation/<seq>/...
     testing/<seq>/...
 
@@ -29,17 +29,17 @@ To load in LLaMAFactory, provide a dataset_info.json with:
 Use --write-dataset-info to auto-generate a minimal dataset_info.json next to the output JSONL.
 
 
-python3 scripts/orad3d_build_vlm_sharegpt.py \
+python3 scripts/orad3d_build_vlm_sharegpt_refine.py \
   --orad-root /home/work/datasets/bg/ORAD-3D \
-  --splits training validation testing \
+  --splits training validation \
     --image-folder image_data \
   --trajectory-key trajectory_ins \
   --num-points 8 \
   --relative-media \
   --media-root /home/work/datasets/bg/ORAD-3D \
-  --out /home/work/datasets/bg/orad3d_vlm/orad3d_all.jsonl \
+  --out /home/work/datasets/bg/orad3d_vlm_refine/orad3d_all.jsonl \
   --write-dataset-info \
-  --dataset-name orad3d_vlm
+  --dataset-name orad3d_vlm_refine
 """
 
 from __future__ import annotations
@@ -151,7 +151,7 @@ def _to_media_path(image_path: Path, opt: BuildOptions) -> str:
 
 def _iter_frame_samples(seq_dir: Path, split: str, opt: BuildOptions) -> Iterator[dict]:
     image_dir = seq_dir / opt.image_folder
-    scene_dir = seq_dir / "scene_data"
+    scene_dir = seq_dir / "scene_data_refine"
     local_dir = seq_dir / "local_path"
 
     if not image_dir.exists() or not scene_dir.exists() or not local_dir.exists():
@@ -332,7 +332,7 @@ def main() -> int:
         print(f"[OK] wrote dataset_info.json -> {opt.out_path.parent / 'dataset_info.json'}")
 
     if count == 0:
-        print("[WARN] no samples were emitted. Check that sequences are extracted and folders exist: gt_image/image_data, scene_data, local_path")
+        print("[WARN] no samples were emitted. Check that sequences are extracted and folders exist: gt_image/image_data, scene_data_refine, local_path")
 
     return 0
 

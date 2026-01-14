@@ -3,7 +3,7 @@
 model_name_or_path: Qwen/Qwen3-VL-2B-Instruct
 trust_remote_code: true
 
-# Use a writable Hugging Face cache directory (avoids permission issues if ~/.cache/huggingface is root-owned).
+# Use a writable Hugging Face cache directory.
 cache_dir: /home/work/byounggun/.cache/hf
 
 # Qwen3-VL processor settings (keep consistent with Qwen examples)
@@ -24,7 +24,7 @@ lora_target: all
 ### dataset
 # Uses ShareGPT multimodal format written by scripts/orad3d_build_vlm_sharegpt.py
 # dataset_info.json must exist under dataset_dir.
-dataset: orad3d_vlm
+dataset: orad3d_vlm_refine
 
 # Use the repo dataset registry (data/dataset_info.json). The dataset file itself can live elsewhere.
 dataset_dir: ./data
@@ -33,11 +33,11 @@ media_dir: /home/work/datasets/bg/ORAD-3D
 # Qwen3-VL template; nothink is usually preferred for SFT
 template: qwen3_vl_nothink
 cutoff_len: 12288
-preprocessing_num_workers: 2
-dataloader_num_workers: 0
+preprocessing_num_workers: 4
+dataloader_num_workers: 4
 
 ### output
-output_dir: /home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_8
+output_dir: /home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine
 logging_steps: 10
 save_strategy: epoch
 plot_loss: true

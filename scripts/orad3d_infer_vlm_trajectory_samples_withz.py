@@ -20,23 +20,30 @@ This script:
 - Samples ORAD-3D frames (or uses explicit --image paths).
 - Runs chat-style multimodal generation.
 - Parses <trajectory> output into 3D points.
-- Saves an overlay PNG only when <trajectory> is present: input image with XY polyline overlay.
+- Saves a composite PNG only when <trajectory> is present: raw image + GT vs prediction trajectory plots.
 - Writes a JSONL manifest with raw outputs and parsed points.
+- GT trajectories are loaded from local_path/<ts>.json when available (fallback to --gt-jsonl).
+- Defaults to base model Qwen/Qwen3-VL-2B-Instruct with LoRA adapter checkpoint-910 at
+  /home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2/checkpoint-910.
 
 Example (ORAD-3D sampling):
-CUDA_VISIBLE_DEVICES=0 python scripts/orad3d_infer_vlm_trajectory_samples_orpo.py --base-model Qwen/Qwen3-VL-2B-Instruct --adapter /home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo/checkpoint-364 --orad-root /home/work/datasets/bg/ORAD-3D --split validation --image-folder image_data --num-samples 5 --out-dir /home/work/byounggun/LlamaFactory/orad3d_infer_samples_orpo --trust-remote-code --use-sharegpt-format --temperature 0
-python scripts/orad3d_infer_vlm_trajectory_samples_orpo.py --base-model Qwen/Qwen3-VL-2B-Instruct --adapter /home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo/checkpoint-364 --orad-root /home/work/datasets/bg/ORAD-3D --split validation --image-folder image_data --num-samples 5 --out-dir /home/work/byounggun/LlamaFactory/orad3d_infer_samples_orpo --trust-remote-code --use-sharegpt-format --temperature 0
-python scripts/orad3d_infer_vlm_trajectory_samples_orpo.py --base-model Qwen/Qwen3-VL-2B-Instruct --adapter /home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2/checkpoint-910 --orad-root /home/work/datasets/bg/ORAD-3D --split validation --image-folder image_data --num-samples 5 --out-dir /home/work/byounggun/LlamaFactory/orad3d_infer_samples_orpo2 --trust-remote-code --use-sharegpt-format --temperature 0
+CUDA_VISIBLE_DEVICES=0 python scripts/orad3d_infer_vlm_trajectory_samples_withz.py \
+  --orad-root /home/work/datasets/bg/ORAD-3D \
+  --split training --image-folder image_data --num-samples 30 \
+  --out-dir /home/work/byounggun/LlamaFactory/orad3d_infer_samples_910 \
+  --cache-dir /home/work/byounggun/.cache/hf \
+  --use-sharegpt-format --temperature 0
 
 
-Example (explicit images):
-    python scripts/orad3d_infer_vlm_trajectory_samples.py \
-        --base-model Qwen/Qwen3-VL-2B-Instruct \
-        --adapter /home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2/checkpoint-819 \
-        --image /home/work/datasets/bg/ORAD-3D/validation/<seq>/image_data/<timestamp>.png \
-        --image /home/work/datasets/bg/ORAD-3D/validation/<seq>/image_data/<timestamp>.png \
-        --out-dir /home/work/byounggun/LlamaFactory/orad3d_infer_samples \
-        --trust-remote-code
+
+python scripts/orad3d_infer_vlm_trajectory_samples.py \
+  --orad-root /home/work/datasets/bg/ORAD-3D \
+  --split training --image-folder image_data --num-samples 30 \
+  --out-dir /home/work/byounggun/LlamaFactory/orad3d_infer_samples_910 \
+  --cache-dir /home/work/byounggun/.cache/hf \
+  --use-sharegpt-format --temperature 0
+
+
 """
 
 from __future__ import annotations
@@ -67,6 +74,9 @@ from transformers import (
 _TRAJ_TOKEN = "<trajectory>"
 _TRAJ_TOKEN_RE = re.compile(r"<\s*trajectory\s*>", re.IGNORECASE)
 _POINT_RE = re.compile(r"\[\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*,\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*\]")
+
+_DEFAULT_BASE_MODEL = "Qwen/Qwen3-VL-2B-Instruct"
+_DEFAULT_ADAPTER_PATH = "/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2/checkpoint-910"
 
 
 @dataclass(frozen=True)
@@ -198,6 +208,78 @@ def _load_gt_trajectories_for_items(
                 # First write wins; these should be unique per image.
                 out.setdefault(k, pts)
 
+    return out
+
+
+def _infer_local_path_from_image(img_path: Path) -> Optional[Path]:
+    parent = img_path.parent
+    if parent.name in ("image_data", "gt_image"):
+        local_dir = parent.parent / "local_path"
+        return local_dir / f"{img_path.stem}.json"
+    return None
+
+
+def _infer_local_path_from_orad_root(img_path: Path, orad_root: Optional[Path]) -> Optional[Path]:
+    if orad_root is None:
+        return None
+    try:
+        rel = img_path.resolve().relative_to(orad_root.resolve())
+    except Exception:
+        return None
+    parts = rel.parts
+    if len(parts) < 4:
+        return None
+    split, seq = parts[0], parts[1]
+    return orad_root / split / seq / "local_path" / f"{img_path.stem}.json"
+
+
+def _load_gt_from_local_path(
+    *,
+    img_path: Path,
+    orad_root: Optional[Path],
+    meta: Dict[str, Any],
+    gt_key: str,
+) -> Optional[List[List[float]]]:
+    candidates: List[Path] = []
+
+    direct = _infer_local_path_from_image(img_path)
+    if direct is not None:
+        candidates.append(direct)
+
+    via_root = _infer_local_path_from_orad_root(img_path, orad_root)
+    if via_root is not None:
+        candidates.append(via_root)
+
+    split = str(meta.get("split") or "").strip()
+    seq = str(meta.get("sequence") or "").strip()
+    ts = str(meta.get("timestamp") or "").strip()
+    if orad_root is not None and split and seq and ts:
+        candidates.append(orad_root / split / seq / "local_path" / f"{ts}.json")
+
+    local_json = next((p for p in candidates if p.is_file()), None)
+    if local_json is None:
+        return None
+
+    try:
+        obj = json.loads(local_json.read_text(encoding="utf-8", errors="ignore"))
+    except Exception:
+        return None
+
+    pts = obj.get(gt_key)
+    if not isinstance(pts, list):
+        return None
+
+    out: List[List[float]] = []
+    for p in pts:
+        if not isinstance(p, list) or len(p) < 2:
+            continue
+        try:
+            out.append([float(p[0]), float(p[1]), float(p[2]) if len(p) > 2 else 0.0])
+        except Exception:
+            continue
+
+    if len(out) < 2:
+        return None
     return out
 
 
@@ -538,6 +620,133 @@ def _draw_polyline(
         prev = cur
 
 
+def _shared_traj_scale(
+    image_size: Tuple[int, int],
+    *,
+    forward_axis: str,
+    flip_lateral: bool,
+    point_sets: Sequence[Optional[Sequence[Sequence[float]]]],
+) -> Optional[float]:
+    """Pick a common px/m scale so GT + prediction overlays are comparable."""
+
+    scales: List[float] = []
+    for pts in point_sets:
+        if not pts or len(pts) < 2:
+            continue
+        _, scale = _traj_xyz_to_pixels(
+            list(pts),
+            image_size,
+            forward_axis=forward_axis,
+            flip_lateral=flip_lateral,
+            scale_px_per_meter=None,
+        )
+        if scale > 0:
+            scales.append(scale)
+
+    if not scales:
+        return None
+    return min(scales)
+
+
+def _render_overlay_panel(
+    *,
+    image: Image.Image,
+    header: str,
+    label: str,
+    points_xyz: List[List[float]],
+    forward_axis: str,
+    flip_lateral: bool,
+    color: Tuple[int, int, int],
+    scale_px_per_meter: Optional[float],
+) -> Image.Image:
+    base = image.convert("RGB")
+    overlay = base.copy()
+
+    uv, scale = _traj_xyz_to_pixels(
+        points_xyz,
+        overlay.size,
+        forward_axis=forward_axis,
+        flip_lateral=flip_lateral,
+        scale_px_per_meter=scale_px_per_meter,
+    )
+    _draw_polyline(overlay, uv, color=color, width=3)
+
+    draw = ImageDraw.Draw(overlay)
+    font = ImageFont.load_default()
+    bar_h = 24
+    draw.rectangle([(0, 0), (overlay.size[0], bar_h)], fill=(20, 20, 20))
+    if points_xyz:
+        text = f"{header} | {label}  N={len(points_xyz)}  scale={scale:.1f}px/m"
+    else:
+        text = f"{header} | {label}  N=0 (no points)"
+    draw.text((10, 6), text, fill=(255, 255, 255), font=font)
+    return overlay
+
+
+def _render_side_by_side_overlays(
+    *,
+    image: Image.Image,
+    header: str,
+    pred_points_xyz: List[List[float]],
+    gt_points_xyz: Optional[List[List[float]]],
+    forward_axis: str,
+    flip_lateral: bool,
+) -> Image.Image:
+    base = image.convert("RGB")
+    shared_scale = _shared_traj_scale(
+        base.size,
+        forward_axis=forward_axis,
+        flip_lateral=flip_lateral,
+        point_sets=[gt_points_xyz, pred_points_xyz],
+    )
+
+    panels: List[Image.Image] = []
+    if gt_points_xyz is not None:
+        panels.append(
+            _render_overlay_panel(
+                image=base,
+                header=header,
+                label="GT",
+                points_xyz=gt_points_xyz,
+                forward_axis=forward_axis,
+                flip_lateral=flip_lateral,
+                color=(0, 200, 0),
+                scale_px_per_meter=shared_scale,
+            )
+        )
+
+    panels.append(
+        _render_overlay_panel(
+            image=base,
+            header=header,
+            label="Inference",
+            points_xyz=pred_points_xyz,
+            forward_axis=forward_axis,
+            flip_lateral=flip_lateral,
+            color=(220, 20, 60),
+            scale_px_per_meter=shared_scale,
+        )
+    )
+
+    gap = 12 if len(panels) > 1 else 0
+    out_w = sum(p.width for p in panels) + gap * (len(panels) - 1)
+    out_h = panels[0].height if panels else base.height
+    out = Image.new("RGB", (out_w, out_h), (255, 255, 255))
+
+    x = 0
+    for panel in panels:
+        out.paste(panel, (x, 0))
+        x += panel.width + gap
+
+    if len(panels) > 1:
+        draw = ImageDraw.Draw(out)
+        for i in range(1, len(panels)):
+            line_x = panels[0].width + (i - 1) * (gap + panels[0].width) + (gap // 2)
+            draw.line([(line_x, 0), (line_x, out_h)], fill=(220, 220, 220), width=1)
+
+    return out
+
+
 def _render_overlay(
     *,
     image: Image.Image,
@@ -590,6 +799,7 @@ def _draw_trajectory_plot(
     points_xyz: List[List[float]],
     forward_axis: str,
     flip_lateral: bool,
+    color: Tuple[int, int, int] = (220, 20, 60),
 ) -> None:
     x0, y0, x1, y1 = box
     w = max(1, x1 - x0)
@@ -646,12 +856,12 @@ def _draw_trajectory_plot(
 
     # Polyline
     for a, b in zip(pts[:-1], pts[1:]):
-        draw.line([a, b], fill=(220, 20, 60), width=3)
+        draw.line([a, b], fill=color, width=3)
 
     # Points
     for p in pts:
         r = 3
-        draw.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=(220, 20, 60))
+        draw.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=color)
 
     draw.text((x0 + 8, y0 + 6), f"traj: N={len(points_xyz)}  scale={scale:.1f}px/m", fill=(0, 0, 0))
 
@@ -707,6 +917,178 @@ def _render_panel(
     return img
 
 
+def _render_traj_compare_panel(
+    *,
+    size: Tuple[int, int],
+    header: str,
+    gt_points: Optional[List[List[float]]],
+    pred_points: List[List[float]],
+    forward_axis: str,
+    flip_lateral: bool,
+) -> Image.Image:
+    w, h = size
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+
+    pad = 12
+    header_h = 26
+    draw.rectangle([(0, 0), (w, header_h)], fill=(245, 245, 245))
+    draw.text((pad, 6), header, fill=(0, 0, 0), font=font)
+
+    plot_top = header_h + pad
+    plot_h = h - plot_top - pad
+    plot_w = (w - 3 * pad) // 2
+
+    left_box = (pad, plot_top, pad + plot_w, plot_top + plot_h)
+    right_box = (pad * 2 + plot_w, plot_top, pad * 2 + plot_w * 2, plot_top + plot_h)
+
+    gt_count = len(gt_points) if gt_points else 0
+    pred_count = len(pred_points)
+
+    draw.text((left_box[0], plot_top - 16), f"GT (N={gt_count})", fill=(0, 120, 0), font=font)
+    draw.text((right_box[0], plot_top - 16), f"Pred (N={pred_count})", fill=(220, 20, 60), font=font)
+
+    _draw_trajectory_plot(
+        draw=draw,
+        box=left_box,
+        points_xyz=gt_points or [],
+        forward_axis=forward_axis,
+        flip_lateral=flip_lateral,
+        color=(0, 160, 0),
+    )
+    _draw_trajectory_plot(
+        draw=draw,
+        box=right_box,
+        points_xyz=pred_points,
+        forward_axis=forward_axis,
+        flip_lateral=flip_lateral,
+        color=(220, 20, 60),
+    )
+
+    return img
+
+
+def _render_z_trend_panel(
+    *,
+    size: Tuple[int, int],
+    gt_points: Optional[List[List[float]]],
+    pred_points: List[List[float]],
+) -> Image.Image:
+    w, h = size
+    img = Image.new("RGB", (w, h), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    font = ImageFont.load_default()
+
+    pad_left = 46
+    pad_right = 16
+    pad_top = 22
+    pad_bottom = 26
+
+    plot_box = (pad_left, pad_top, w - pad_right, h - pad_bottom)
+    x0, y0, x1, y1 = plot_box
+    draw.rectangle([x0, y0, x1, y1], outline=(180, 180, 180), width=1)
+    draw.text((12, 4), "Z trend (relative)", fill=(0, 0, 0), font=font)
+
+    def _z_series(points: Optional[List[List[float]]]) -> List[float]:
+        if not points or len(points) < 2:
+            return []
+        z0 = float(points[0][2]) if len(points[0]) > 2 else 0.0
+        out: List[float] = []
+        for p in points:
+            if not isinstance(p, list) or len(p) < 3:
+                out.append(0.0)
+            else:
+                out.append(float(p[2]) - z0)
+        return out
+
+    gt_z = _z_series(gt_points)
+    pred_z = _z_series(pred_points)
+
+    all_z = gt_z + pred_z
+    if all_z:
+        z_min = min(all_z)
+        z_max = max(all_z)
+    else:
+        z_min, z_max = -1.0, 1.0
+
+    if abs(z_max - z_min) < 1e-6:
+        z_min -= 1.0
+        z_max += 1.0
+
+    usable_w = max(1, x1 - x0)
+    usable_h = max(1, y1 - y0)
+
+    def _to_xy(series: List[float]) -> List[Tuple[float, float]]:
+        if not series:
+            return []
+        n = len(series)
+        if n == 1:
+            xs = [x0 + usable_w / 2.0]
+        else:
+            xs = [x0 + (i * usable_w / (n - 1)) for i in range(n)]
+        ys = [y1 - ((z - z_min) / (z_max - z_min)) * usable_h for z in series]
+        return list(zip(xs, ys))
+
+    # Zero line
+    if z_min <= 0.0 <= z_max:
+        y_zero = y1 - ((0.0 - z_min) / (z_max - z_min)) * usable_h
+        draw.line([(x0, y_zero), (x1, y_zero)], fill=(220, 220, 220), width=1)
+
+    def _draw_series(points: List[Tuple[float, float]], color: Tuple[int, int, int]) -> None:
+        if len(points) < 2:
+            return
+        for a, b in zip(points[:-1], points[1:]):
+            draw.line([a, b], fill=color, width=2)
+        for p in points:
+            r = 2
+            draw.ellipse([p[0] - r, p[1] - r, p[0] + r, p[1] + r], fill=color)
+
+    _draw_series(_to_xy(gt_z), color=(0, 160, 0))
+    _draw_series(_to_xy(pred_z), color=(220, 20, 60))
+
+    draw.text((x0, y1 + 4), f"GT N={len(gt_z)}", fill=(0, 120, 0), font=font)
+    draw.text((x0 + 120, y1 + 4), f"Pred N={len(pred_z)}", fill=(220, 20, 60), font=font)
+
+    return img
+
+
+def _make_image_with_traj_comparison(
+    *,
+    image: Image.Image,
+    header: str,
+    gt_points: Optional[List[List[float]]],
+    pred_points: List[List[float]],
+    forward_axis: str,
+    flip_lateral: bool,
+) -> Image.Image:
+    base = image.convert("RGB")
+    panel_w = max(560, base.size[0] // 2)
+    panel = _render_traj_compare_panel(
+        size=(panel_w, base.size[1]),
+        header=header,
+        gt_points=gt_points,
+        pred_points=pred_points,
+        forward_axis=forward_axis,
+        flip_lateral=flip_lateral,
+    )
+    top = Image.new("RGB", (base.size[0] + panel.size[0], base.size[1]), (255, 255, 255))
+    top.paste(base, (0, 0))
+    top.paste(panel, (base.size[0], 0))
+
+    z_panel_h = max(140, base.size[1] // 4)
+    z_panel = _render_z_trend_panel(
+        size=(top.size[0], z_panel_h),
+        gt_points=gt_points,
+        pred_points=pred_points,
+    )
+
+    out = Image.new("RGB", (top.size[0], top.size[1] + z_panel.size[1]), (255, 255, 255))
+    out.paste(top, (0, 0))
+    out.paste(z_panel, (0, top.size[1]))
+    return out
+
+
 def _make_composite(
     *,
     image: Image.Image,
@@ -738,8 +1120,13 @@ def _make_composite(
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Infer ORAD-3D VLM and visualize trajectory output.")
 
-    ap.add_argument("--base-model", type=str, required=True, help="HF model id or local path")
-    ap.add_argument("--adapter", type=str, required=True, help="LoRA checkpoint dir (e.g., .../checkpoint-xxx)")
+    ap.add_argument("--base-model", type=str, default=_DEFAULT_BASE_MODEL, help=f"HF model id or local path (default: {_DEFAULT_BASE_MODEL})")
+    ap.add_argument(
+        "--adapter",
+        type=str,
+        default=_DEFAULT_ADAPTER_PATH,
+        help=f"LoRA checkpoint dir (default: {_DEFAULT_ADAPTER_PATH})",
+    )
     ap.add_argument("--cache-dir", type=str, default="/home/work/byounggun/.cache/hf")
     ap.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"])
     ap.add_argument("--device-map", type=str, default="auto", help="Transformers device_map (default: auto)")
@@ -798,7 +1185,13 @@ def parse_args() -> argparse.Namespace:
         "--gt-jsonl",
         type=Path,
         default=None,
-        help="Optional ShareGPT-style JSONL containing GT trajectories (e.g., /home/work/datasets/bg/orad3d_vlm/orad3d_all.jsonl).",
+        help="Optional ShareGPT-style JSONL containing GT trajectories (e.g., /data3/orad3d_vlm/orad3d_all.jsonl).",
+    )
+    ap.add_argument(
+        "--gt-key",
+        type=str,
+        default="trajectory_ins",
+        help="Key in local_path/*.json to use as GT trajectory when available.",
     )
     ap.add_argument("--split", type=str, default="validation", choices=["training", "validation", "testing"])
     ap.add_argument("--image-folder", type=str, default="image_data", choices=["image_data", "gt_image"])
@@ -953,18 +1346,24 @@ def main() -> int:
                 )
             continue
 
-        gt_points: Optional[List[List[float]]] = None
-        for cand in _candidate_image_keys(img_path, orad_root=args.orad_root, meta=meta):
-            if cand in gt_map:
-                gt_points = gt_map[cand]
-                break
+        gt_points: Optional[List[List[float]]] = _load_gt_from_local_path(
+            img_path=img_path,
+            orad_root=args.orad_root,
+            meta=meta,
+            gt_key=args.gt_key,
+        )
+        if gt_points is None:
+            for cand in _candidate_image_keys(img_path, orad_root=args.orad_root, meta=meta):
+                if cand in gt_map:
+                    gt_points = gt_map[cand]
+                    break
 
         header = key
-        overlay = _render_overlay(
+        overlay = _make_image_with_traj_comparison(
             image=image,
             header=header,
-            points_xyz=traj_points,
-            gt_points_xyz=gt_points,
+            gt_points=gt_points,
+            pred_points=traj_points,
             forward_axis=args.forward_axis,
             flip_lateral=bool(args.flip_lateral),
         )
