@@ -41,7 +41,7 @@ preprocessing_num_workers: 4
 dataloader_num_workers: 4
 
 ### output
-output_dir: /data3/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2
+output_dir: /home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2
 logging_steps: 10
 save_strategy: epoch
 plot_loss: true
