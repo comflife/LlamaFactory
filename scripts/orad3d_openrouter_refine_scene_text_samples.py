@@ -1,28 +1,25 @@
 #!/usr/bin/env python3
-"""Refine ORAD-3D scene text using OpenRouter (OpenAI SDK compatible).
+"""
+Refine ORAD-3D scene text using OpenRouter (OpenAI SDK compatible).
 
 This script builds a model-conditioning image that includes:
     - the front-facing camera image
     - a side GT trajectory XY plot
     - a bottom GT Z-trend plot
 
-Then it calls an OpenRouter model (vision-capable) to refine scene text.
-"""
-
-"""Example:
-
-python scripts/orad3d_openrouter_refine_scene_text_samples.py \
-    --model openai/gpt-5.2 \
-    --num-samples 20
+Example:
+    python scripts/orad3d_openrouter_refine_scene_text_samples.py \
+        --model google/gemini-3-flash-preview \
+        --num-samples 20
 
 Environment (.env):
     OPENROUTER_API_KEY=...
-    # Optional but recommended by OpenRouter:
     OPENROUTER_HTTP_REFERER=https://your.domain
-    OPENROUTER_APP_TITLE=orad3d-openrouter-refine
+    OPENROUTER_APP_TITLE=orad3d-xai-refine
 """
 
 from __future__ import annotations
+
 
 import argparse
 import base64
@@ -126,6 +123,14 @@ def _safe_choice_message_content(choice: Dict[str, Any]) -> str:
     return ""
 
 
+def _is_refined_too_short(text: str, min_words: int) -> bool:
+    words = [w for w in text.strip().split() if w]
+    return len(words) < min_words
+
+
+SHORT_REFINE_ERROR = "Refined text too short or empty."
+
+
 def call_xai_chat(
     client: OpenAI,
     model: str,
@@ -151,6 +156,42 @@ def call_xai_chat(
     return {}
 
 
+def request_refinement(
+    *,
+    client: OpenAI,
+    model: str,
+    messages: List[Dict[str, Any]],
+    max_tokens: int,
+    temperature: float,
+    retries: int,
+    retry_sleep_s: float,
+    min_words: int,
+) -> Tuple[str, Dict[str, Any]]:
+    last_response: Dict[str, Any] = {}
+    for attempt in range(retries + 1):
+        try:
+            response_json = call_xai_chat(
+                client=client,
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                retries=0,
+                retry_sleep_s=retry_sleep_s,
+            )
+            last_response = response_json
+            choices = response_json.get("choices", [])
+            refined = _safe_choice_message_content(choices[0]) if choices else ""
+            if refined and not _is_refined_too_short(refined, min_words):
+                return refined, response_json
+            raise RuntimeError(SHORT_REFINE_ERROR)
+        except Exception:
+            if attempt >= retries:
+                raise
+            time.sleep(retry_sleep_s * (2 ** attempt))
+    return "", last_response
+
+
 def build_prompt(original_text: str) -> Tuple[str, str]:
     system = (
         "You are a careful autonomous-driving dataset annotator. "
@@ -159,22 +200,33 @@ def build_prompt(original_text: str) -> Tuple[str, str]:
     )
 
     user = (
-        "Task: Refine the scene text so it helps off-road trajectory prediction.\n"
+        "Task: Refine the scene text so it helps off-road trajectory generation.\n"
         "You will receive ONE composite image that contains:\n"
         "(1) a front-facing driving camera image,\n"
-        "(2) a GT trajectory plot showing direction/curvature (side panel),\n"
-        "(3) a GT Z-trend plot showing relative elevation changes (bottom panel).\n\n"
+        "(2) a side panel showing the XY path direction/curvature,\n"
+        "(3) a bottom panel showing the elevation profile.\n\n"
         "Goal: produce a better scene description that explains WHY the shown trajectory makes sense. "
-        "The original text may be generic or irrelevant; rewrite it to match the image and trajectory.\n\n"
+        "Use the extra panels as reference to infer the path and elevation, "
+        "but do not mention panels, plots, graphs, or GT in the output. "
+        "Use the original description only if it is consistent, "
+        "but always rewrite in your own words (never return it verbatim).\n\n"
         "Hard constraints:\n"
-        "- No arrows or arrow-like symbols (do NOT use '→' or '->').\n"
+        "- No arrows or arrow-like symbols (do NOT use '->' or '=>').\n"
         "- Plain ASCII only.\n"
-        "- 1 to 2 sentences total (very concise).\n"
-        "- Mention only what can be inferred from the image and the provided GT plots.\n\n"
-        "In 1 to 2 sentences, MUST include:\n"
-        "- Trajectory direction/shape: left/right/straight + gentle vs sharp + if multi-segment, summarize the sequence.\n"
+        "- Mention only what can be inferred from the image and the provided visuals.\n"
+        "- Do NOT use the words 'z', 'z-trend', or 'z trend'.\n"
+        "- Do NOT mention plots/graphs/GT/panels; do NOT say 'plot shows' or 'GT shows'.\n"
+        "- If attribution is needed, use 'the image shows', not 'the plot shows'.\n"
+        "- Avoid hedging like 'mostly straight' or 'nearly straight'; if it is straight, say straight.\n\n"
+        "MUST include:\n"
+        "- Trajectory direction/shape and magnitude: left/right/straight + gentle vs sharp; "
+        "if multi-segment, summarize the sequence. Decide left vs right by the XY view, not the camera view; "
+        "be accurate about whether the path bends left or right. "
+        "Judge left/right magnitude from the XY view; "
+        "if lateral offset is large, say clearly/strongly left or right, not slightly. "
+        "Only use straight if the XY view stays near vertical with minimal lateral drift.\n"
         "- Path-affecting factors ahead: obstacles/risks that influence the trajectory and whether it avoids them.\n"
-        "- Z-trend: mostly flat vs uphill vs downhill vs bumpy/undulating (no numbers).\n"
+        "- Elevation behavior: mostly flat vs uphill vs downhill vs bumpy/undulating (no numbers).\n"
         "Tip: use commas and semicolons to pack information, but keep it readable.\n\n"
         f"Original description (to refine):\n{original_text}"
     )
@@ -525,10 +577,10 @@ def gather_pairs(
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Refine ORAD-3D scene text using xAI API.")
-    ap.add_argument("--orad-root", type=Path, default=Path("/data3/ORAD-3D"))
+    ap.add_argument("--orad-root", type=Path, default=Path("/home/work/datasets/bg/ORAD-3D"))
     ap.add_argument("--split", type=str, default="training", choices=["training", "validation", "testing"])
     ap.add_argument("--image-folder", type=str, default="image_data", choices=["image_data", "gt_image"])
-    ap.add_argument("--out-dir", type=Path, default=Path("/home/byounggun/LlamaFactory/orad3d_xai_refine_samples"))
+    ap.add_argument("--out-dir", type=Path, default=Path("/home/work/byounggun/LlamaFactory/orad3d_openrouter_refine_samples"))
     ap.add_argument("--num-samples", type=int, default=10)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-scan", type=int, default=None)
@@ -563,6 +615,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--timeout", type=int, default=120)
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument(
+        "--min-refined-words",
+        type=int,
+        default=8,
+        help="Retry if refined text has fewer words than this.",
+    )
     ap.add_argument("--retries", type=int, default=2)
     ap.add_argument("--retry-sleep", type=float, default=1.0)
 
@@ -656,7 +714,7 @@ def main() -> int:
                 },
             ]
             try:
-                response_json = call_xai_chat(
+                refined, response_json = request_refinement(
                     client=client,
                     model=args.model,
                     messages=messages,
@@ -664,13 +722,15 @@ def main() -> int:
                     temperature=args.temperature,
                     retries=args.retries,
                     retry_sleep_s=args.retry_sleep,
+                    min_words=args.min_refined_words,
                 )
-                choices = response_json.get("choices", [])
-                if choices:
-                    refined = _safe_choice_message_content(choices[0]) or refined
             except Exception as e:
-                response_json = {"error": str(e)}
-                if not args.continue_on_error:
+                err = str(e)
+                response_json = {"error": err}
+                if err == SHORT_REFINE_ERROR:
+                    refined = ""
+                    print(f"[WARN] {seq} {ts}: refined text too short; keeping empty.")
+                elif not args.continue_on_error:
                     raise
 
         header = f"{args.split} / {seq} / {ts}"
