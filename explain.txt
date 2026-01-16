@@ -15,3 +15,4 @@ llamafactory-cli train examples/train_lora/orad3d_qwen3vl_2b_lora_orpo.
 CUDA_VISIBLE_DEVICES=0,1 llamafactory-cli train examples/train_lora/orad3d_qwen3vl_2b_lora_sft_v2_refine.yaml
 CUDA_VISIBLE_DEVICES=2,3 llamafactory-cli train examples/train_lora/orad3d_qwen3vl_2b_lora_sft_v2.yaml
 CUDA_VISIBLE_DEVICES=2,3 llamafactory-cli train examples/train_lora/orad3d_qwen3vl_2b_lora_orpo.yaml
+llamafactory-cli train examples/train_lora/orad3d_qwen3vl_2b_lora_sft_v2.yaml

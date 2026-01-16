@@ -39,7 +39,7 @@
     }
   },
   "orad3d_vlm": {
-    "file_name": "/data3/orad3d_vlm/orad3d_all.jsonl",
+    "file_name": "/home/work/datasets/bg/orad3d_vlm/orad3d_all.jsonl",
     "formatting": "sharegpt",
     "columns": {
       "messages": "messages",

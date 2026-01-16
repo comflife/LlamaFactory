@@ -12,7 +12,7 @@ scripts/orad3d_visualize_orpo_pairs_withz.py.
 Example:
 python scripts/orad3d_compare_vlm_models_withz.py \
   --base-model Qwen/Qwen3-VL-2B-Instruct \
-  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-104 \
+  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-208 \
   --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2/checkpoint-182 \
   --adapter orpo=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2/checkpoint-182 \
   --orad-root /home/work/datasets/bg/ORAD-3D \
