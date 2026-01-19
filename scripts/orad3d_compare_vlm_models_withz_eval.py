@@ -829,6 +829,7 @@ def _draw_traj_compare_plot(
     draw_gt: bool = True,
 ) -> None:
     x0, y0, x1, y1 = box
+    font = ImageFont.load_default()
     draw.rectangle([x0, y0, x1, y1], outline=(180, 180, 180), width=1)
 
     if len(gt_points) < 2 and len(pred_points) < 2:
@@ -853,6 +854,13 @@ def _draw_traj_compare_plot(
     bottom = y0 + h - margin
     draw.line([(cx, y0 + margin), (cx, y0 + h - margin)], fill=(220, 220, 220), width=1)
     draw.line([(x0 + margin, bottom), (x0 + w - margin, bottom)], fill=(220, 220, 220), width=1)
+
+    unit_label = "m"
+    if hasattr(draw, "textlength"):
+        unit_w = int(draw.textlength(unit_label, font=font))
+    else:
+        unit_w = len(unit_label) * 6
+    draw.text((x1 - unit_w - 6, y0 + 4), unit_label, fill=(110, 110, 110), font=font)
 
     if draw_gt and len(gt_points) >= 2:
         fwd_gt, lat_gt = _points_forward_lateral(gt_points, forward_axis=forward_axis, flip_lateral=flip_lateral)
@@ -1240,6 +1248,7 @@ def _render_z_trend_panel(
     x0, y0, x1, y1 = plot_box
     draw.rectangle([x0, y0, x1, y1], outline=(180, 180, 180), width=1)
     draw.text((12, 4), "Z trend (relative)", fill=(0, 0, 0), font=font)
+    draw.text((12, 16), "z - z0", fill=(110, 110, 110), font=font)
 
     def _z_series(points: List[List[float]]) -> List[float]:
         if not points or len(points) < 2:
