@@ -3,7 +3,7 @@
 
 python3 scripts/orad3d_build_vlm_orpo.py \
   --orad-root /home/work/datasets/bg/ORAD-3D \
-  --splits training validation \
+  --splits training validation testing \
   --image-folder image_data \
   --trajectory-key trajectory_ins \
   --num-points 8 \
@@ -457,7 +457,7 @@ def _collect_trajectory_pool(opt: BuildOptions) -> List[Tuple[Tuple[str, str, st
             leave=False,
         ):
             image_dir = seq_dir / opt.image_folder
-            scene_dir = seq_dir / "scene_data"
+            scene_dir = seq_dir / "scene_data_refine"
             local_dir = seq_dir / "local_path"
 
             if not (image_dir.exists() and scene_dir.exists() and local_dir.exists()):
@@ -512,7 +512,7 @@ class _SeqItem:
 
 def _collect_sequence_items(seq_dir: Path, split: str, opt: BuildOptions) -> list[_SeqItem]:
     image_dir = seq_dir / opt.image_folder
-    scene_dir = seq_dir / "scene_data"
+    scene_dir = seq_dir / "scene_data_refine"
     local_dir = seq_dir / "local_path"
 
     if not (image_dir.exists() and scene_dir.exists() and local_dir.exists()):
@@ -707,7 +707,7 @@ def _iter_frame_samples(
     traj_pool: List[Tuple[Tuple[str, str, str], list[list[float]], str]],
 ) -> Iterator[dict]:
     image_dir = seq_dir / opt.image_folder
-    scene_dir = seq_dir / "scene_data"
+    scene_dir = seq_dir / "scene_data_refine"
     local_dir = seq_dir / "local_path"
 
     if not (image_dir.exists() and scene_dir.exists() and local_dir.exists()):

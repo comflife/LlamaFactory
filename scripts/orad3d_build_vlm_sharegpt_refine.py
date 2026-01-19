@@ -31,7 +31,7 @@ Use --write-dataset-info to auto-generate a minimal dataset_info.json next to th
 
 python3 scripts/orad3d_build_vlm_sharegpt_refine.py \
   --orad-root /home/work/datasets/bg/ORAD-3D \
-  --splits training validation \
+  --splits training validation testing \
     --image-folder image_data \
   --trajectory-key trajectory_ins \
   --num-points 8 \

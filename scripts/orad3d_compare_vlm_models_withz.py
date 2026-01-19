@@ -12,11 +12,11 @@ scripts/orad3d_visualize_orpo_pairs_withz.py.
 Example:
 python scripts/orad3d_compare_vlm_models_withz.py \
   --base-model Qwen/Qwen3-VL-2B-Instruct \
-  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-208 \
-  --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2/checkpoint-182 \
+  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-3132 \
+  --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_8/checkpoint-3132 \
   --adapter orpo=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2/checkpoint-182 \
   --orad-root /home/work/datasets/bg/ORAD-3D \
-  --split training --image-folder image_data --num-samples 20 \
+  --split testing --image-folder image_data --num-samples 20 \
   --out-dir /home/work/byounggun/LlamaFactory/orad3d_compare_models_withz \
   --cache-dir /home/work/byounggun/.cache/hf \
   --use-sharegpt-format --temperature 0
