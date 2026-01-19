@@ -1390,6 +1390,22 @@ def _parse_adapter_specs(values: Sequence[str]) -> List[AdapterSpec]:
     return specs
 
 
+
+
+def _parse_num_samples(value: Optional[str]) -> Optional[int]:
+    if value is None:
+        return None
+    raw = str(value).strip().lower()
+    if raw in ("all", "full"):
+        return None
+    try:
+        parsed = int(raw)
+    except Exception as exc:
+        raise SystemExit(f"Invalid --num-samples value: {value}") from exc
+    if parsed <= 0:
+        return None
+    return parsed
+
 def _sample_items(
     *,
     args: argparse.Namespace,
@@ -1427,8 +1443,10 @@ def _sample_items(
     if not pairs:
         raise SystemExit("No ORAD-3D images found for the given split/image-folder.")
 
+    num_samples = _parse_num_samples(args.num_samples)
+
     rng = random.Random(args.seed)
-    if int(args.num_samples) > 0:
+    if num_samples is not None:
         rng.shuffle(pairs)
 
     for seq, ts, img_path in pairs:
@@ -1445,7 +1463,7 @@ def _sample_items(
         if gt_points is None:
             continue
         items.append(SampleItem(key=key, image_path=img_path, gt_points=gt_points, meta=meta))
-        if int(args.num_samples) > 0 and len(items) >= int(args.num_samples):
+        if num_samples is not None and len(items) >= num_samples:
             break
 
     return items
@@ -1610,7 +1628,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--gt-key", type=str, default="trajectory_ins")
     ap.add_argument("--split", type=str, default="training", choices=["training", "validation", "testing"])
     ap.add_argument("--image-folder", type=str, default="image_data", choices=["image_data", "gt_image"])
-    ap.add_argument("--num-samples", type=int, default=10)
+    ap.add_argument("--num-samples", type=str, default="10", help="Number of samples to run (use all for full split).")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-scan", type=int, default=None)
 
