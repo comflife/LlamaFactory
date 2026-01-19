@@ -13,7 +13,7 @@ Overlay projection defaults to per-frame calib (cam_K + cam_RT, plus lidar_R if 
 Use --projection simple to fall back to the ego-plane scaling overlay.
 
 Example:
-python scripts/orad3d_compare_vlm_models_withz_advanced.py \
+python scripts/orad3d_compare_vlm_models_withz_eval.py \
   --base-model Qwen/Qwen3-VL-2B-Instruct \
   --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-3654 \
   --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_8/checkpoint-3654 \
@@ -23,7 +23,7 @@ python scripts/orad3d_compare_vlm_models_withz_advanced.py \
   --out-dir /home/work/byounggun/LlamaFactory/orad3d_compare_models_withz \
   --cache-dir /home/work/byounggun/.cache/hf \
   --use-sharegpt-format --temperature 1e-6 \
-  --metric-horizons 1,2,3
+  --hit-threshold 2.0
 """
 
 from __future__ import annotations
@@ -903,10 +903,18 @@ def _final_l2(gt_points: List[List[float]], pred_points: List[List[float]]) -> O
 
 
 
-def _l2_point(a: Sequence[float], b: Sequence[float]) -> float:
+def _l2_point_xy(a: Sequence[float], b: Sequence[float]) -> float:
     dx = float(a[0]) - float(b[0])
     dy = float(a[1]) - float(b[1])
-    dz = float(a[2]) - float(b[2])
+    return math.sqrt(dx * dx + dy * dy)
+
+
+def _l2_point_xyz(a: Sequence[float], b: Sequence[float]) -> float:
+    dx = float(a[0]) - float(b[0])
+    dy = float(a[1]) - float(b[1])
+    az = float(a[2]) if len(a) > 2 else 0.0
+    bz = float(b[2]) if len(b) > 2 else 0.0
+    dz = az - bz
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
@@ -939,20 +947,20 @@ def _compute_adapter_metrics(
     items: Sequence[SampleItem],
     adapters: Sequence[AdapterSpec],
     results_by_model: Dict[str, Dict[str, ModelOutput]],
-    horizon_specs: Sequence[Tuple[str, float]],
+    hit_threshold: float,
 ) -> List[Dict[str, Any]]:
     if not items:
         return []
 
-    horizons: List[Tuple[str, float]] = [(label, frac) for label, frac in horizon_specs if frac > 0]
-    if not horizons:
-        horizons = [("1/3", 1.0 / 3.0), ("2/3", 2.0 / 3.0), ("3/3", 1.0)]
-
     metrics: List[Dict[str, Any]] = []
     total = len(items)
     for adapter in adapters:
-        sums = {label: 0.0 for label, _ in horizons}
-        counts = {label: 0 for label, _ in horizons}
+        sum_ade_xy = 0.0
+        sum_ade_xyz = 0.0
+        sum_fde_xy = 0.0
+        sum_fde_xyz = 0.0
+        hits_xy = 0
+        hits_xyz = 0
         valid = 0
 
         for item in items:
@@ -961,44 +969,56 @@ def _compute_adapter_metrics(
                 continue
             pred = out.trajectory_points
             gt = item.gt_points
-            if len(gt) < 2:
+            if len(gt) < 2 or len(pred) < 1:
                 continue
             valid += 1
 
             gt_len = len(gt)
             pred_len = len(pred)
-            if pred_len < 1:
-                continue
-
-            for label, frac in horizons:
-                gt_idx = int(round(frac * (gt_len - 1)))
+            total_xy = 0.0
+            total_xyz = 0.0
+            max_xy = 0.0
+            max_xyz = 0.0
+            for i in range(gt_len):
+                frac = 0.0 if gt_len == 1 else (i / (gt_len - 1))
                 pred_idx = int(round(frac * (pred_len - 1)))
-                gt_idx = max(0, min(gt_len - 1, gt_idx))
                 pred_idx = max(0, min(pred_len - 1, pred_idx))
-                g = gt[gt_idx]
-                p = pred[pred_idx]
-                sums[label] += _l2_point(g, p)
-                counts[label] += 1
+                d_xy = _l2_point_xy(gt[i], pred[pred_idx])
+                d_xyz = _l2_point_xyz(gt[i], pred[pred_idx])
+                total_xy += d_xy
+                total_xyz += d_xyz
+                if d_xy > max_xy:
+                    max_xy = d_xy
+                if d_xyz > max_xyz:
+                    max_xyz = d_xyz
+
+            ade_xy = total_xy / gt_len
+            ade_xyz = total_xyz / gt_len
+            fde_xy = _l2_point_xy(gt[-1], pred[-1])
+            fde_xyz = _l2_point_xyz(gt[-1], pred[-1])
+            sum_ade_xy += ade_xy
+            sum_ade_xyz += ade_xyz
+            sum_fde_xy += fde_xy
+            sum_fde_xyz += fde_xyz
+            if max_xy < hit_threshold:
+                hits_xy += 1
+            if max_xyz < hit_threshold:
+                hits_xyz += 1
 
         failure_rate = 1.0 - (valid / total if total else 0.0)
-        horizons_out: Dict[str, Dict[str, Any]] = {}
-        for label, frac in horizons:
-            count = counts[label]
-            avg = (sums[label] / count) if count else None
-            horizons_out[label] = {
-                "fraction": frac,
-                "count": count,
-                "avg_l2": avg,
-            }
-
         metrics.append(
             {
                 "adapter": adapter.name,
                 "total_samples": total,
                 "valid_samples": valid,
                 "failure_rate": failure_rate,
-                "horizons": horizons_out,
-                "horizon_order": [label for label, _ in horizons],
+                "ADE_xy": (sum_ade_xy / valid) if valid else None,
+                "FDE_xy": (sum_fde_xy / valid) if valid else None,
+                "HitRate_xy": (hits_xy / valid) if valid else None,
+                "ADE_xyz": (sum_ade_xyz / valid) if valid else None,
+                "FDE_xyz": (sum_fde_xyz / valid) if valid else None,
+                "HitRate_xyz": (hits_xyz / valid) if valid else None,
+                "hit_threshold": hit_threshold,
             }
         )
 
@@ -1589,13 +1609,20 @@ def parse_args() -> argparse.Namespace:
         "--traj-step-sec",
         type=float,
         default=0.1,
-        help="(unused for ratio metrics) Seconds per trajectory point (kept for compatibility).",
+        help="(unused) Kept for CLI compatibility.",
     )
     ap.add_argument(
         "--metric-horizons",
         type=str,
         default="1,2,3",
-        help="Comma-separated horizon positions; values are normalized by max (e.g., '1,2,3' -> thirds).",
+        help="(unused) Kept for CLI compatibility.",
+    )
+
+    ap.add_argument(
+        "--hit-threshold",
+        type=float,
+        default=2.0,
+        help="HitRate threshold in meters (max L2 < threshold).",
     )
 
     ap.add_argument("--forward-axis", choices=["x", "y"], default="y")
@@ -1714,7 +1741,7 @@ def main() -> int:
         items=items,
         adapters=adapters,
         results_by_model=results_by_model,
-        horizon_specs=_parse_horizon_seconds(str(args.metric_horizons)),
+        hit_threshold=float(args.hit_threshold),
     )
     if metrics:
         metrics_path = args.out_dir / "adapter_metrics.json"
@@ -1723,16 +1750,14 @@ def main() -> int:
         for entry in metrics:
             parts = [
                 f"adapter={entry['adapter']}",
+                f"ADE_xy={entry['ADE_xy']:.3f}" if entry.get("ADE_xy") is not None else "ADE_xy=n/a",
+                f"FDE_xy={entry['FDE_xy']:.3f}" if entry.get("FDE_xy") is not None else "FDE_xy=n/a",
+                f"HitRate_xy={entry['HitRate_xy']:.3f}" if entry.get("HitRate_xy") is not None else "HitRate_xy=n/a",
+                f"ADE_xyz={entry['ADE_xyz']:.3f}" if entry.get("ADE_xyz") is not None else "ADE_xyz=n/a",
+                f"FDE_xyz={entry['FDE_xyz']:.3f}" if entry.get("FDE_xyz") is not None else "FDE_xyz=n/a",
+                f"HitRate_xyz={entry['HitRate_xyz']:.3f}" if entry.get("HitRate_xyz") is not None else "HitRate_xyz=n/a",
                 f"failure_rate={entry['failure_rate']:.3f}",
             ]
-            horizons = entry.get("horizons", {})
-            for key in entry.get("horizon_order", list(horizons.keys())):
-                info = horizons.get(key, {})
-                avg = info.get("avg_l2")
-                if avg is None:
-                    parts.append(f"{key}=n/a")
-                else:
-                    parts.append(f"{key}={avg:.3f}")
             print("[METRICS] " + " ".join(parts))
 
     print(f"[DONE] wrote {saved} comparisons -> {args.out_dir}")
