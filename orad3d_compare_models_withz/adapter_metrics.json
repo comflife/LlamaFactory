@@ -1,0 +1,48 @@
+[
+  {
+    "adapter": "sft_refine",
+    "total_samples": 5,
+    "valid_samples": 5,
+    "failure_rate": 0.0,
+    "horizons": {
+      "1s": {
+        "index": 5,
+        "count": 5,
+        "avg_l2": 27.91807870903606
+      },
+      "2s": {
+        "index": 10,
+        "count": 0,
+        "avg_l2": null
+      },
+      "3s": {
+        "index": 15,
+        "count": 0,
+        "avg_l2": null
+      }
+    }
+  },
+  {
+    "adapter": "sft",
+    "total_samples": 5,
+    "valid_samples": 5,
+    "failure_rate": 0.0,
+    "horizons": {
+      "1s": {
+        "index": 5,
+        "count": 5,
+        "avg_l2": 31.088878787713043
+      },
+      "2s": {
+        "index": 10,
+        "count": 0,
+        "avg_l2": null
+      },
+      "3s": {
+        "index": 15,
+        "count": 0,
+        "avg_l2": null
+      }
+    }
+  }
+]

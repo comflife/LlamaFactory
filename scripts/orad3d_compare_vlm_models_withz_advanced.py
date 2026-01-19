@@ -9,8 +9,11 @@ This script runs inference for multiple adapters, then renders a composite per s
 Only samples with valid GT trajectories (>=2 points) are kept by default, similar to
 scripts/orad3d_visualize_orpo_pairs_withz.py.
 
+Overlay projection defaults to per-frame calib (cam_K + cam_RT, plus lidar_R if present).
+Use --projection simple to fall back to the ego-plane scaling overlay.
+
 Example:
-python scripts/orad3d_compare_vlm_models_withz.py \
+python scripts/orad3d_compare_vlm_models_withz_advanced.py \
   --base-model Qwen/Qwen3-VL-2B-Instruct \
   --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-3654 \
   --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_8/checkpoint-3654 \
@@ -19,7 +22,8 @@ python scripts/orad3d_compare_vlm_models_withz.py \
   --split testing --image-folder image_data --num-samples 5 \
   --out-dir /home/work/byounggun/LlamaFactory/orad3d_compare_models_withz \
   --cache-dir /home/work/byounggun/.cache/hf \
-  --use-sharegpt-format --temperature 1e-6
+  --use-sharegpt-format --temperature 1e-6 --projection calib --traj-step-sec 0.2 \
+  --metric-horizons 1,2,3
 """
 
 from __future__ import annotations
@@ -98,6 +102,18 @@ class SampleResult:
     meta: Dict[str, Any]
 
 
+@dataclass(frozen=True)
+class Calib:
+    fx: float
+    fy: float
+    cx: float
+    cy: float
+    R: List[List[float]]  # 3x3 camera extrinsic rotation
+    t: List[float]  # 3x1 camera extrinsic translation
+    lidar_R: Optional[List[List[float]]] = None  # 3x3 lidar->vehicle rotation
+    lidar_t: Optional[List[float]] = None  # 3x1 lidar translation (optional)
+
+
 def _normalize_path_str(p: str) -> str:
     return str(p).replace("\\", "/").lstrip("./")
 
@@ -143,6 +159,57 @@ def _clean_output_text(text: str) -> str:
         return ""
     cleaned = text.replace("<tool_call>", "").replace("</tool_call>", "").replace("<tool_call/>", "")
     return cleaned.strip()
+
+
+def _parse_floats_from_line(prefix: str, line: str) -> List[float]:
+    if not line.startswith(prefix):
+        return []
+    return [float(x) for x in line[len(prefix) :].strip().split() if x]
+
+
+def _load_calib(seq_dir: Path, ts: str) -> Optional[Calib]:
+    path = seq_dir / "calib" / f"{ts}.txt"
+    if not path.exists():
+        return None
+
+    k_vals: List[float] = []
+    rt_vals: List[float] = []
+    lidar_r_vals: List[float] = []
+    lidar_t_vals: List[float] = []
+
+    try:
+        for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw_line.strip()
+            if line.startswith("cam_K:"):
+                k_vals = _parse_floats_from_line("cam_K:", line)
+            elif line.startswith("cam_RT:"):
+                rt_vals = _parse_floats_from_line("cam_RT:", line)
+            elif line.startswith("lidar_R:"):
+                lidar_r_vals = _parse_floats_from_line("lidar_R:", line)
+            elif line.startswith("lidar_T:"):
+                lidar_t_vals = _parse_floats_from_line("lidar_T:", line)
+        if len(k_vals) != 9 or len(rt_vals) != 16:
+            return None
+        fx, _, cx, _, fy, cy, _, _, _ = k_vals
+        R = [
+            [rt_vals[0], rt_vals[1], rt_vals[2]],
+            [rt_vals[4], rt_vals[5], rt_vals[6]],
+            [rt_vals[8], rt_vals[9], rt_vals[10]],
+        ]
+        t = [rt_vals[3], rt_vals[7], rt_vals[11]]
+        lidar_R = None
+        lidar_t = None
+        if len(lidar_r_vals) == 9:
+            lidar_R = [
+                [lidar_r_vals[0], lidar_r_vals[1], lidar_r_vals[2]],
+                [lidar_r_vals[3], lidar_r_vals[4], lidar_r_vals[5]],
+                [lidar_r_vals[6], lidar_r_vals[7], lidar_r_vals[8]],
+            ]
+        if len(lidar_t_vals) >= 3:
+            lidar_t = [lidar_t_vals[0], lidar_t_vals[1], lidar_t_vals[2]]
+        return Calib(fx=fx, fy=fy, cx=cx, cy=cy, R=R, t=t, lidar_R=lidar_R, lidar_t=lidar_t)
+    except Exception:
+        return None
 
 
 def _candidate_image_keys(img_path: Path, *, orad_root: Optional[Path], meta: Dict[str, Any]) -> List[str]:
@@ -502,6 +569,88 @@ def _iter_orad_pairs(
 
     return pairs
 
+def _infer_seq_dir_for_item(item: SampleItem, *, orad_root: Optional[Path]) -> Optional[Path]:
+    parent = item.image_path.parent
+    if parent.name in ("image_data", "gt_image"):
+        return parent.parent
+    split = str(item.meta.get("split") or "").strip()
+    seq = str(item.meta.get("sequence") or "").strip()
+    if orad_root is not None and split and seq:
+        return orad_root / split / seq
+    return None
+
+
+def _apply_rigid_transform(
+    points_xyz: List[List[float]],
+    R: List[List[float]],
+    t: Optional[List[float]] = None,
+) -> List[List[float]]:
+    if not points_xyz:
+        return []
+    t = t or [0.0, 0.0, 0.0]
+    out: List[List[float]] = []
+    for p in points_xyz:
+        if len(p) < 3:
+            continue
+        x, y, z = float(p[0]), float(p[1]), float(p[2])
+        out.append(
+            [
+                R[0][0] * x + R[0][1] * y + R[0][2] * z + t[0],
+                R[1][0] * x + R[1][1] * y + R[1][2] * z + t[1],
+                R[2][0] * x + R[2][1] * y + R[2][2] * z + t[2],
+            ]
+        )
+    return out
+
+
+def _project_points_with_calib(points: List[List[float]], calib: Calib) -> List[Tuple[float, float]]:
+    if not points:
+        return []
+
+    def project(points_xyz: List[List[float]], R: List[List[float]], t: List[float]) -> List[Tuple[float, float]]:
+        out: List[Tuple[float, float]] = []
+        for p in points_xyz:
+            if len(p) < 3:
+                continue
+            x, y, z = float(p[0]), float(p[1]), float(p[2])
+            xc = R[0][0] * x + R[0][1] * y + R[0][2] * z + t[0]
+            yc = R[1][0] * x + R[1][1] * y + R[1][2] * z + t[1]
+            zc = R[2][0] * x + R[2][1] * y + R[2][2] * z + t[2]
+            if zc <= 1e-6:
+                continue
+            u = calib.fx * (xc / zc) + calib.cx
+            v = calib.fy * (yc / zc) + calib.cy
+            out.append((u, v))
+        return out
+
+    Rt = [
+        [calib.R[0][0], calib.R[1][0], calib.R[2][0]],
+        [calib.R[0][1], calib.R[1][1], calib.R[2][1]],
+        [calib.R[0][2], calib.R[1][2], calib.R[2][2]],
+    ]
+    t_inv = [
+        -(Rt[0][0] * calib.t[0] + Rt[0][1] * calib.t[1] + Rt[0][2] * calib.t[2]),
+        -(Rt[1][0] * calib.t[0] + Rt[1][1] * calib.t[1] + Rt[1][2] * calib.t[2]),
+        -(Rt[2][0] * calib.t[0] + Rt[2][1] * calib.t[1] + Rt[2][2] * calib.t[2]),
+    ]
+
+    def best_projection(points_xyz: List[List[float]]) -> List[Tuple[float, float]]:
+        direct = project(points_xyz, calib.R, calib.t)
+        inverse = project(points_xyz, Rt, t_inv)
+        return inverse if len(inverse) > len(direct) else direct
+
+    candidates: List[List[List[float]]] = [points]
+    if calib.lidar_R is not None:
+        candidates.append(_apply_rigid_transform(points, calib.lidar_R, calib.lidar_t))
+
+    best: List[Tuple[float, float]] = []
+    for pts in candidates:
+        proj = best_projection(pts)
+        if len(proj) > len(best):
+            best = proj
+    return best
+
+
 
 def _traj_xyz_to_pixels(
     points_xyz: List[List[float]],
@@ -753,6 +902,104 @@ def _final_l2(gt_points: List[List[float]], pred_points: List[List[float]]) -> O
     return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
+
+def _l2_point(a: Sequence[float], b: Sequence[float]) -> float:
+    dx = float(a[0]) - float(b[0])
+    dy = float(a[1]) - float(b[1])
+    dz = float(a[2]) - float(b[2])
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+
+def _parse_horizon_seconds(raw: str) -> List[float]:
+    if not raw:
+        return []
+    parts = re.split(r"[\s,]+", raw.strip())
+    out: List[float] = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            v = float(p)
+        except Exception:
+            continue
+        if v > 0:
+            out.append(v)
+    # De-dup while preserving order.
+    seen: set[float] = set()
+    uniq: List[float] = []
+    for v in out:
+        if v in seen:
+            continue
+        seen.add(v)
+        uniq.append(v)
+    return uniq
+
+
+def _metric_index_for_seconds(sec: float, step_sec: float) -> int:
+    if step_sec <= 0:
+        raise ValueError("step_sec must be > 0")
+    return max(0, int(round(sec / step_sec)))
+
+
+def _compute_adapter_metrics(
+    *,
+    items: Sequence[SampleItem],
+    adapters: Sequence[AdapterSpec],
+    results_by_model: Dict[str, Dict[str, ModelOutput]],
+    horizons_sec: Sequence[float],
+    step_sec: float,
+) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+
+    horizons = [float(h) for h in horizons_sec if h > 0]
+    horizon_indices = {h: _metric_index_for_seconds(h, step_sec) for h in horizons}
+
+    metrics: List[Dict[str, Any]] = []
+    total = len(items)
+    for adapter in adapters:
+        sums = {h: 0.0 for h in horizons}
+        counts = {h: 0 for h in horizons}
+        valid = 0
+
+        for item in items:
+            out = results_by_model.get(adapter.name, {}).get(item.key)
+            if out is None or not out.valid or len(out.trajectory_points) < 2:
+                continue
+            pred = out.trajectory_points
+            gt = item.gt_points
+            valid += 1
+
+            for h, idx in horizon_indices.items():
+                if len(gt) > idx and len(pred) > idx:
+                    sums[h] += _l2_point(gt[idx], pred[idx])
+                    counts[h] += 1
+
+        failure_rate = 1.0 - (valid / total if total else 0.0)
+        horizons_out: Dict[str, Dict[str, Any]] = {}
+        for h in horizons:
+            key = f"{h:g}s"
+            count = counts[h]
+            avg = (sums[h] / count) if count else None
+            horizons_out[key] = {
+                "index": horizon_indices[h],
+                "count": count,
+                "avg_l2": avg,
+            }
+
+        metrics.append(
+            {
+                "adapter": adapter.name,
+                "total_samples": total,
+                "valid_samples": valid,
+                "failure_rate": failure_rate,
+                "horizons": horizons_out,
+            }
+        )
+
+    return metrics
+
+
 def _render_overlay_multimodel(
     *,
     image: Image.Image,
@@ -762,40 +1009,59 @@ def _render_overlay_multimodel(
     forward_axis: str,
     flip_lateral: bool,
     line_width: int,
+    calib: Optional[Calib] = None,
 ) -> Image.Image:
     base = image.convert("RGB")
     overlay = base.copy()
 
-    point_sets: List[Optional[Sequence[Sequence[float]]]] = [gt_points]
-    point_sets.extend([pts for _, pts, _ in model_points])
-    shared_scale = _shared_traj_scale(
-        overlay.size,
-        forward_axis=forward_axis,
-        flip_lateral=flip_lateral,
-        point_sets=point_sets,
-    )
+    use_calib = calib is not None
+    if use_calib:
+        gt_uv = _project_points_with_calib(gt_points, calib) if len(gt_points) >= 2 else []
+        model_uvs = [
+            _project_points_with_calib(pts, calib) if len(pts) >= 2 else []
+            for _, pts, _ in model_points
+        ]
+        if len(gt_uv) < 2 and all(len(uv) < 2 for uv in model_uvs):
+            use_calib = False
 
-    if len(gt_points) >= 2:
-        uv_gt, _ = _traj_xyz_to_pixels(
-            gt_points,
+    if use_calib:
+        if len(gt_uv) >= 2:
+            _draw_polyline(overlay, gt_uv, color=(0, 200, 0), width=line_width)
+        for (name, pts, color), uv in zip(model_points, model_uvs):
+            if len(uv) < 2:
+                continue
+            _draw_polyline(overlay, uv, color=color, width=line_width)
+    else:
+        point_sets: List[Optional[Sequence[Sequence[float]]]] = [gt_points]
+        point_sets.extend([pts for _, pts, _ in model_points])
+        shared_scale = _shared_traj_scale(
             overlay.size,
             forward_axis=forward_axis,
             flip_lateral=flip_lateral,
-            scale_px_per_meter=shared_scale,
+            point_sets=point_sets,
         )
-        _draw_polyline(overlay, uv_gt, color=(0, 200, 0), width=line_width)
 
-    for _, pts, color in model_points:
-        if len(pts) < 2:
-            continue
-        uv, _ = _traj_xyz_to_pixels(
-            pts,
-            overlay.size,
-            forward_axis=forward_axis,
-            flip_lateral=flip_lateral,
-            scale_px_per_meter=shared_scale,
-        )
-        _draw_polyline(overlay, uv, color=color, width=line_width)
+        if len(gt_points) >= 2:
+            uv_gt, _ = _traj_xyz_to_pixels(
+                gt_points,
+                overlay.size,
+                forward_axis=forward_axis,
+                flip_lateral=flip_lateral,
+                scale_px_per_meter=shared_scale,
+            )
+            _draw_polyline(overlay, uv_gt, color=(0, 200, 0), width=line_width)
+
+        for _, pts, color in model_points:
+            if len(pts) < 2:
+                continue
+            uv, _ = _traj_xyz_to_pixels(
+                pts,
+                overlay.size,
+                forward_axis=forward_axis,
+                flip_lateral=flip_lateral,
+                scale_px_per_meter=shared_scale,
+            )
+            _draw_polyline(overlay, uv, color=color, width=line_width)
 
     draw = ImageDraw.Draw(overlay)
     font = ImageFont.load_default()
@@ -1028,6 +1294,7 @@ def _make_composite(
     flip_lateral: bool,
     panel_width: int,
     line_width: int,
+    calib: Optional[Calib] = None,
 ) -> Image.Image:
     model_points = [(out.name, out.trajectory_points, color) for out, color in model_outputs]
     overlay = _render_overlay_multimodel(
@@ -1038,6 +1305,7 @@ def _make_composite(
         forward_axis=forward_axis,
         flip_lateral=flip_lateral,
         line_width=line_width,
+        calib=calib,
     )
 
     panel = _render_model_panel(
@@ -1315,8 +1583,29 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--max-scan", type=int, default=None)
 
+    ap.add_argument(
+        "--traj-step-sec",
+        type=float,
+        default=0.1,
+        help="Seconds per trajectory point for 1s/2s/3s metrics (set to dataset sampling step).",
+    )
+    ap.add_argument(
+        "--metric-horizons",
+        type=str,
+        default="1,2,3",
+        help="Comma-separated horizon seconds for metrics (e.g., '1,2,3').",
+    )
+
+
     ap.add_argument("--forward-axis", choices=["x", "y"], default="y")
     ap.add_argument("--flip-lateral", action="store_true")
+
+    ap.add_argument(
+        "--projection",
+        choices=["simple", "calib"],
+        default="calib",
+        help="Overlay projection mode: 'calib' uses cam_K/cam_RT (and lidar_R if present), 'simple' uses ego-plane scaling.",
+    )
     ap.add_argument("--panel-width", type=int, default=620)
     ap.add_argument("--line-width", type=int, default=4)
     ap.add_argument(
@@ -1389,6 +1678,9 @@ def main() -> int:
             if missing and not bool(args.allow_missing_models):
                 continue
 
+            seq_dir = _infer_seq_dir_for_item(item, orad_root=args.orad_root) if args.projection == "calib" else None
+            calib = _load_calib(seq_dir, item.image_path.stem) if seq_dir is not None else None
+
             header = item.key
             comp = _make_composite(
                 image=Image.open(item.image_path).convert("RGB"),
@@ -1399,6 +1691,7 @@ def main() -> int:
                 flip_lateral=bool(args.flip_lateral),
                 panel_width=int(args.panel_width),
                 line_width=int(args.line_width),
+                calib=calib,
             )
 
             saved += 1
@@ -1414,6 +1707,31 @@ def main() -> int:
                 meta=item.meta,
             )
             f.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
+
+
+    metrics = _compute_adapter_metrics(
+        items=items,
+        adapters=adapters,
+        results_by_model=results_by_model,
+        horizons_sec=_parse_horizon_seconds(str(args.metric_horizons)),
+        step_sec=float(args.traj_step_sec),
+    )
+    if metrics:
+        metrics_path = args.out_dir / "adapter_metrics.json"
+        metrics_path.write_text(json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"[METRICS] wrote {metrics_path}")
+        for entry in metrics:
+            parts = [
+                f"adapter={entry['adapter']}",
+                f"failure_rate={entry['failure_rate']:.3f}",
+            ]
+            for key, info in entry.get("horizons", {}).items():
+                avg = info.get("avg_l2")
+                if avg is None:
+                    parts.append(f"{key}=n/a")
+                else:
+                    parts.append(f"{key}={avg:.3f}")
+            print("[METRICS] " + " ".join(parts))
 
     print(f"[DONE] wrote {saved} comparisons -> {args.out_dir}")
     print(f"Manifest: {manifest_path}")
