@@ -23,7 +23,7 @@ python scripts/orad3d_compare_vlm_models_withz_eval_v4.py \
   --out-dir /home/work/byounggun/LlamaFactory/orad3d_compare_models_withz \
   --cache-dir /home/work/byounggun/.cache/hf \
   --use-sharegpt-format --temperature 1e-6 \
-  --hit-threshold 2.0
+  --hit-threshold 2.0 --frames-per-point 7 --auto-frames-per-point --failure-threshold 10.0
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import json
+import statistics
 import math
 import os
 import random
@@ -1104,11 +1105,256 @@ def _parse_horizon_seconds(raw: str) -> List[Tuple[str, float]]:
     if not values:
         return []
 
-    max_val = max(values)
-    if max_val <= 1.0:
-        return [(f"{v:g}", v) for v in values]
+    out: List[Tuple[str, float]] = []
+    seen: set[str] = set()
+    for v in values:
+        label = f"{v:g}"
+        if label in seen:
+            continue
+        seen.add(label)
+        out.append((label, v))
+    return out
 
-    return [(f"{v:g}/{max_val:g}", v / max_val) for v in values]
+
+def _compute_pointwise_metrics(
+    pred_points: List[List[float]],
+    gt_points: List[List[float]],
+    *,
+    horizons: Sequence[Tuple[str, float]],
+    step_sec: float,
+    miss_threshold: float,
+    dist_fn: Any,
+    failure_threshold: Optional[float] = None,
+) -> Dict[str, Optional[float]]:
+    if len(pred_points) < 2 or len(gt_points) < 2:
+        return {}
+    n = min(len(pred_points), len(gt_points))
+    if n < 2:
+        return {}
+
+    pred = pred_points[:n]
+    gt = gt_points[:n]
+    dists = [dist_fn(g, p) for g, p in zip(gt, pred)]
+    if not dists:
+        return {}
+
+    metrics: Dict[str, Optional[float]] = {
+        "ADE_avg": sum(dists) / n,
+        "FDE": dists[-1],
+        "missRate_2": 1.0 if max(dists) > miss_threshold else 0.0,
+    }
+
+    step_sec = max(float(step_sec), 1e-6)
+    steps_per_sec = max(1, int(round(1.0 / step_sec)))
+
+    if failure_threshold is not None:
+        end = min(n, steps_per_sec)
+        if end > 0:
+            metrics["failure_1s"] = 1.0 if max(dists[:end]) > failure_threshold else 0.0
+        else:
+            metrics["failure_1s"] = None
+
+    if horizons:
+        for label, seconds in horizons:
+            horizon_steps = max(1, int(round(float(seconds) / step_sec)))
+            start = max(0, horizon_steps - steps_per_sec)
+            end = horizon_steps
+            key = f"ADE_{label}s"
+            if end <= n and end > start:
+                seg = dists[start:end]
+                metrics[key] = sum(seg) / len(seg)
+            else:
+                metrics[key] = None
+
+    return metrics
+
+
+def _load_pose_timestamps(seq_dir: Path) -> List[int]:
+    pose_path = seq_dir / "poses.txt"
+    if not pose_path.is_file():
+        return []
+    timestamps: List[int] = []
+    for raw_line in pose_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        if not parts:
+            continue
+        try:
+            ts = int(parts[0])
+        except Exception:
+            continue
+        timestamps.append(ts)
+    timestamps.sort()
+    return timestamps
+
+
+def _median_frame_dt_sec(timestamps: Sequence[int]) -> Optional[float]:
+    if len(timestamps) < 2:
+        return None
+    diffs = [(b - a) / 1000.0 for a, b in zip(timestamps[:-1], timestamps[1:]) if b > a]
+    if not diffs:
+        return None
+    return float(statistics.median(diffs))
+
+
+def _get_seq_point_step_sec(
+    seq_dir: Path,
+    *,
+    frames_per_point: int,
+    fallback: float,
+    cache: Dict[str, float],
+) -> float:
+    if frames_per_point <= 0:
+        return fallback
+    key = str(seq_dir)
+    cached = cache.get(key)
+    if cached is not None:
+        return cached
+    timestamps = _load_pose_timestamps(seq_dir)
+    dt_sec = _median_frame_dt_sec(timestamps)
+    if dt_sec is None or dt_sec <= 0:
+        cache[key] = fallback
+    else:
+        cache[key] = dt_sec * frames_per_point
+    return cache[key]
+
+
+def _load_pose_xy(seq_dir: Path) -> List[Tuple[int, float, float]]:
+    pose_path = seq_dir / "poses.txt"
+    if not pose_path.is_file():
+        return []
+    out: List[Tuple[int, float, float]] = []
+    for raw_line in pose_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(",")
+        if len(parts) < 3:
+            continue
+        try:
+            ts = int(parts[0])
+            x = float(parts[1])
+            y = float(parts[2])
+        except Exception:
+            continue
+        out.append((ts, x, y))
+    out.sort(key=lambda v: v[0])
+    return out
+
+
+def _median_frame_displacement(poses: Sequence[Tuple[int, float, float]]) -> Optional[float]:
+    if len(poses) < 2:
+        return None
+    diffs: List[float] = []
+    for (t0, x0, y0), (t1, x1, y1) in zip(poses[:-1], poses[1:]):
+        if t1 <= t0:
+            continue
+        diffs.append(math.hypot(x1 - x0, y1 - y0))
+    if not diffs:
+        return None
+    return float(statistics.median(diffs))
+
+
+def _collect_traj_step_distances(seq_dir: Path, sample_limit: int) -> List[float]:
+    local_dir = seq_dir / "local_path"
+    if not local_dir.is_dir():
+        return []
+    files = sorted(local_dir.glob("*.json"))
+    if not files:
+        return []
+    if sample_limit > 0 and len(files) > sample_limit:
+        stride = max(1, len(files) // sample_limit)
+        files = files[::stride][:sample_limit]
+
+    dists: List[float] = []
+    for f in files:
+        try:
+            obj = json.loads(f.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        traj = obj.get("trajectory_ins") or []
+        if len(traj) < 2:
+            continue
+        for a, b in zip(traj[:-1], traj[1:]):
+            try:
+                dists.append(_l2_point_xy(a, b))
+            except Exception:
+                continue
+    return dists
+
+
+def _estimate_frames_per_point_for_seq(
+    seq_dir: Path,
+    *,
+    sample_limit: int,
+    max_k: int,
+) -> Optional[Dict[str, Any]]:
+    poses = _load_pose_xy(seq_dir)
+    frame_disp = _median_frame_displacement(poses)
+    if frame_disp is None or frame_disp <= 0:
+        return None
+
+    step_dists = _collect_traj_step_distances(seq_dir, sample_limit)
+    if not step_dists:
+        return None
+    traj_step = float(statistics.median(step_dists))
+
+    max_k = max(1, int(max_k))
+    best_k = 1
+    best_err = abs(traj_step - frame_disp)
+    for k in range(2, max_k + 1):
+        err = abs(traj_step - (frame_disp * k))
+        if err < best_err:
+            best_err = err
+            best_k = k
+
+    ratio = traj_step / frame_disp if frame_disp > 0 else None
+    return {
+        "seq": seq_dir.name,
+        "frames_per_point": best_k,
+        "ratio": ratio,
+        "frame_disp": frame_disp,
+        "traj_step": traj_step,
+    }
+
+
+def _estimate_frames_per_point_from_items(
+    items: Sequence[SampleItem],
+    *,
+    orad_root: Optional[Path],
+    sample_limit: int,
+    max_k: int,
+) -> Tuple[Optional[int], List[Dict[str, Any]]]:
+    seq_dirs: List[Path] = []
+    seen: set[str] = set()
+    for item in items:
+        seq_dir = _infer_seq_dir_for_item(item, orad_root=orad_root)
+        if seq_dir is None:
+            continue
+        key = str(seq_dir)
+        if key in seen:
+            continue
+        seen.add(key)
+        seq_dirs.append(seq_dir)
+
+    rows: List[Dict[str, Any]] = []
+    for seq_dir in sorted(seq_dirs, key=lambda p: p.name):
+        row = _estimate_frames_per_point_for_seq(seq_dir, sample_limit=sample_limit, max_k=max_k)
+        if row is None:
+            continue
+        rows.append(row)
+
+    if not rows:
+        return None, rows
+
+    frames = [row["frames_per_point"] for row in rows if row.get("frames_per_point")]
+    if not frames:
+        return None, rows
+
+    median_k = int(statistics.median(frames))
+    return median_k, rows
 
 
 def _compute_adapter_metrics(
@@ -1117,6 +1363,11 @@ def _compute_adapter_metrics(
     adapters: Sequence[AdapterSpec],
     results_by_model: Dict[str, Dict[str, ModelOutput]],
     hit_threshold: float,
+    horizons: Sequence[Tuple[str, float]],
+    item_step_sec: Dict[str, float],
+    traj_step_sec: float,
+    frames_per_point: int,
+    failure_threshold: float,
     collect_samples: bool = False,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, List[Dict[str, Any]]]]:
     if not items:
@@ -1135,6 +1386,14 @@ def _compute_adapter_metrics(
         hits_xyz = 0
         valid = 0
         rows: List[Dict[str, Any]] = []
+
+        point_valid = 0
+        sum_ade_avg = 0.0
+        sum_fde = 0.0
+        miss_count = 0
+        failure_count = 0
+        horizon_sums: Dict[str, float] = {f"ADE_{label}s": 0.0 for label, _ in horizons}
+        horizon_counts: Dict[str, int] = {key: 0 for key in horizon_sums}
 
         for item in items:
             out = results_by_model.get(adapter.name, {}).get(item.key)
@@ -1156,6 +1415,35 @@ def _compute_adapter_metrics(
             coverage_ratio = s_pred_end / s_gt_end
 
             valid += 1
+
+            step_sec = float(item_step_sec.get(item.key, traj_step_sec))
+            point_metrics = _compute_pointwise_metrics(
+                pred,
+                gt,
+                horizons=horizons,
+                step_sec=step_sec,
+                miss_threshold=2.0,
+                dist_fn=_l2_point_xy,
+                failure_threshold=failure_threshold,
+            )
+            if point_metrics:
+                ade_avg = point_metrics.get("ADE_avg")
+                fde = point_metrics.get("FDE")
+                if ade_avg is not None and fde is not None:
+                    point_valid += 1
+                    sum_ade_avg += float(ade_avg)
+                    sum_fde += float(fde)
+                    miss_val = point_metrics.get("missRate_2")
+                    if miss_val is not None:
+                        miss_count += int(miss_val > 0.0)
+                    failure_val = point_metrics.get("failure_1s")
+                    if failure_val is not None:
+                        failure_count += int(failure_val > 0.0)
+                    for key in horizon_sums:
+                        val = point_metrics.get(key)
+                        if val is not None:
+                            horizon_sums[key] += float(val)
+                            horizon_counts[key] += 1
 
             gt_len = len(gt)
             total_xy = 0.0
@@ -1191,27 +1479,33 @@ def _compute_adapter_metrics(
                 hits_xyz += 1
 
             if collect_samples:
-                rows.append(
-                    {
-                        "key": item.key,
-                        "gt_len": gt_len,
-                        "pred_len": len(pred),
-                        "s_gt": s_gt_end,
-                        "s_pred": s_pred_end,
-                        "coverage_ratio": coverage_ratio,
-                        "ade_xy": ade_xy,
-                        "fde_xy": fde_xy,
-                        "max_xy": max_xy,
-                        "hit_xy": hit_xy,
-                        "ade_xyz": ade_xyz,
-                        "fde_xyz": fde_xyz,
-                        "max_xyz": max_xyz,
-                        "hit_xyz": hit_xyz,
-                    }
-                )
+                row = {
+                    "key": item.key,
+                    "gt_len": gt_len,
+                    "pred_len": len(pred),
+                    "s_gt": s_gt_end,
+                    "s_pred": s_pred_end,
+                    "coverage_ratio": coverage_ratio,
+                    "ade_xy": ade_xy,
+                    "fde_xy": fde_xy,
+                    "max_xy": max_xy,
+                    "hit_xy": hit_xy,
+                    "ade_xyz": ade_xyz,
+                    "fde_xyz": fde_xyz,
+                    "max_xyz": max_xyz,
+                    "hit_xyz": hit_xyz,
+                    "point_step_sec": step_sec,
+                }
+                if point_metrics:
+                    row.update(point_metrics)
+                rows.append(row)
 
+        horizon_metrics: Dict[str, Optional[float]] = {}
+        for key, total_val in horizon_sums.items():
+            count = horizon_counts[key]
+            horizon_metrics[key] = (total_val / count) if count else None
 
-        failure_rate = 1.0 - (valid / total if total else 0.0)
+        failure_rate = (failure_count / point_valid) if point_valid else None
         metrics.append(
             {
                 "adapter": adapter.name,
@@ -1225,7 +1519,14 @@ def _compute_adapter_metrics(
                 "FDE_xyz": (sum_fde_xyz / valid) if valid else None,
                 "HitRate_xyz": (hits_xyz / valid) if valid else None,
                 "Coverage_ratio": (sum_coverage / valid) if valid else None,
+                "ADE_avg": (sum_ade_avg / point_valid) if point_valid else None,
+                "FDE": (sum_fde / point_valid) if point_valid else None,
+                "missRate_2": (miss_count / point_valid) if point_valid else None,
+                **horizon_metrics,
                 "hit_threshold": hit_threshold,
+                "failure_threshold_1s": failure_threshold,
+                "frames_per_point": frames_per_point,
+                "default_traj_step_sec": traj_step_sec,
             }
         )
 
@@ -1844,13 +2145,42 @@ def parse_args() -> argparse.Namespace:
         "--traj-step-sec",
         type=float,
         default=0.1,
-        help="(unused) Kept for CLI compatibility.",
+        help="Fallback trajectory timestep in seconds when poses.txt is missing or frames-per-point <= 0.",
     )
     ap.add_argument(
         "--metric-horizons",
         type=str,
         default="1,2,3",
-        help="(unused) Kept for CLI compatibility.",
+        help="Comma-separated horizon seconds for ADE_{h}s segment metrics (e.g., 1,2,3).",
+    )
+    ap.add_argument(
+        "--frames-per-point",
+        type=int,
+        default=7,
+        help="Frames per trajectory point when mapping seconds from poses.txt (<= 0 disables).",
+    )
+
+    ap.add_argument(
+        "--estimate-frames-per-point",
+        action="store_true",
+        help="Estimate frames-per-point from poses.txt and trajectory spacing for the sampled scenes.",
+    )
+    ap.add_argument(
+        "--estimate-samples",
+        type=int,
+        default=20,
+        help="Number of local_path JSONs per scene to sample when estimating frames-per-point.",
+    )
+    ap.add_argument(
+        "--estimate-max-k",
+        type=int,
+        default=20,
+        help="Max frames-per-point candidate to consider when estimating.",
+    )
+    ap.add_argument(
+        "--auto-frames-per-point",
+        action="store_true",
+        help="Override --frames-per-point with the estimated median when available.",
     )
 
     ap.add_argument(
@@ -1858,6 +2188,12 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=2.0,
         help="HitRate threshold in meters (max L2 < threshold).",
+    )
+    ap.add_argument(
+        "--failure-threshold",
+        type=float,
+        default=10.0,
+        help="Failure threshold in meters for max L2 within the first second.",
     )
 
     ap.add_argument("--forward-axis", choices=["x", "y"], default="y")
@@ -1910,6 +2246,34 @@ def main() -> int:
     items = _sample_items(args=args, gt_map=gt_map)
     if not items:
         raise SystemExit("No samples with valid GT trajectories found.")
+
+    if bool(args.estimate_frames_per_point) or bool(args.auto_frames_per_point):
+        est_k, rows = _estimate_frames_per_point_from_items(
+            items,
+            orad_root=args.orad_root,
+            sample_limit=int(args.estimate_samples),
+            max_k=int(args.estimate_max_k),
+        )
+        if est_k is None:
+            print("[ESTIMATE] Unable to estimate frames-per-point (missing poses.txt or trajectories).")
+        else:
+            print(f"[ESTIMATE] frames_per_point median={est_k} from {len(rows)} scenes")
+            if rows:
+                preview = rows[:5]
+                for row in preview:
+                    ratio = row.get("ratio")
+                    ratio_str = f"{ratio:.2f}" if isinstance(ratio, float) else "n/a"
+                    print(
+                        "[ESTIMATE] "
+                        + f"seq={row.get('seq')} "
+                        + f"k={row.get('frames_per_point')} "
+                        + f"ratio={ratio_str} "
+                        + f"frame_disp={row.get('frame_disp'):.3f} "
+                        + f"traj_step={row.get('traj_step'):.3f}"
+                    )
+            if bool(args.auto_frames_per_point):
+                print(f"[ESTIMATE] overriding --frames-per-point={est_k}")
+                args.frames_per_point = int(est_k)
 
     results_by_model: Dict[str, Dict[str, ModelOutput]] = {}
     for adapter in adapters:
@@ -1972,11 +2336,35 @@ def main() -> int:
             f.write(json.dumps(asdict(result), ensure_ascii=False) + "\n")
 
 
+    horizons = _parse_horizon_seconds(str(args.metric_horizons))
+    frames_per_point = int(args.frames_per_point)
+    seq_step_cache: Dict[str, float] = {}
+    item_step_sec: Dict[str, float] = {}
+    for item in items:
+        step_sec = float(args.traj_step_sec)
+        if frames_per_point > 0:
+            seq_dir = _infer_seq_dir_for_item(item, orad_root=args.orad_root)
+            if seq_dir is not None:
+                step_sec = _get_seq_point_step_sec(
+                    seq_dir,
+                    frames_per_point=frames_per_point,
+                    fallback=step_sec,
+                    cache=seq_step_cache,
+                )
+        item_step_sec[item.key] = step_sec
+
+    horizon_keys = [f"ADE_{label}s" for label, _ in horizons]
+
     metrics, sample_rows = _compute_adapter_metrics(
         items=items,
         adapters=adapters,
         results_by_model=results_by_model,
         hit_threshold=float(args.hit_threshold),
+        horizons=horizons,
+        item_step_sec=item_step_sec,
+        traj_step_sec=float(args.traj_step_sec),
+        frames_per_point=frames_per_point,
+        failure_threshold=float(args.failure_threshold),
         collect_samples=bool(args.debug_metrics),
     )
     if metrics:
@@ -1986,15 +2374,28 @@ def main() -> int:
         for entry in metrics:
             parts = [
                 f"adapter={entry['adapter']}",
-                f"ADE_xy={entry['ADE_xy']:.3f}" if entry.get("ADE_xy") is not None else "ADE_xy=n/a",
-                f"FDE_xy={entry['FDE_xy']:.3f}" if entry.get("FDE_xy") is not None else "FDE_xy=n/a",
-                f"HitRate_xy={entry['HitRate_xy']:.3f}" if entry.get("HitRate_xy") is not None else "HitRate_xy=n/a",
-                f"ADE_xyz={entry['ADE_xyz']:.3f}" if entry.get("ADE_xyz") is not None else "ADE_xyz=n/a",
-                f"FDE_xyz={entry['FDE_xyz']:.3f}" if entry.get("FDE_xyz") is not None else "FDE_xyz=n/a",
-                f"HitRate_xyz={entry['HitRate_xyz']:.3f}" if entry.get("HitRate_xyz") is not None else "HitRate_xyz=n/a",
-                f"Coverage={entry['Coverage_ratio']:.3f}" if entry.get("Coverage_ratio") is not None else "Coverage=n/a",
-                f"failure_rate={entry['failure_rate']:.3f}",
+                f"ADE_avg={entry['ADE_avg']:.3f}" if entry.get("ADE_avg") is not None else "ADE_avg=n/a",
+                f"FDE={entry['FDE']:.3f}" if entry.get("FDE") is not None else "FDE=n/a",
+                f"missRate_2={entry['missRate_2']:.3f}" if entry.get("missRate_2") is not None else "missRate_2=n/a",
             ]
+            for key in horizon_keys:
+                val = entry.get(key)
+                if val is not None:
+                    parts.append(f"{key}={val:.3f}")
+                else:
+                    parts.append(f"{key}=n/a")
+            parts.extend(
+                [
+                    f"ADE_xy={entry['ADE_xy']:.3f}" if entry.get("ADE_xy") is not None else "ADE_xy=n/a",
+                    f"FDE_xy={entry['FDE_xy']:.3f}" if entry.get("FDE_xy") is not None else "FDE_xy=n/a",
+                    f"HitRate_xy={entry['HitRate_xy']:.3f}" if entry.get("HitRate_xy") is not None else "HitRate_xy=n/a",
+                    f"ADE_xyz={entry['ADE_xyz']:.3f}" if entry.get("ADE_xyz") is not None else "ADE_xyz=n/a",
+                    f"FDE_xyz={entry['FDE_xyz']:.3f}" if entry.get("FDE_xyz") is not None else "FDE_xyz=n/a",
+                    f"HitRate_xyz={entry['HitRate_xyz']:.3f}" if entry.get("HitRate_xyz") is not None else "HitRate_xyz=n/a",
+                    f"Coverage={entry['Coverage_ratio']:.3f}" if entry.get("Coverage_ratio") is not None else "Coverage=n/a",
+                    f"failure_rate={entry['failure_rate']:.3f}" if entry.get("failure_rate") is not None else "failure_rate=n/a",
+                ]
+            )
             print("[METRICS] " + " ".join(parts))
 
     if bool(args.debug_metrics) and sample_rows:
