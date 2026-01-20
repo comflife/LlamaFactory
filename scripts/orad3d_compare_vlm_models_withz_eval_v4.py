@@ -1060,6 +1060,23 @@ def _interp_at_frac(points: List[List[float]], frac: float) -> List[float]:
 
 
 
+def _resample_points_by_index(points: List[List[float]], target_len: int) -> List[List[float]]:
+    if target_len <= 0 or not points:
+        return []
+    if target_len == 1:
+        return [_interp_at_frac(points, 0.0)]
+    if len(points) == 1:
+        p0 = points[0]
+        out = [
+            float(p0[0]),
+            float(p0[1]),
+            float(p0[2]) if len(p0) > 2 else 0.0,
+        ]
+        return [list(out) for _ in range(target_len)]
+    return [_interp_at_frac(points, i / (target_len - 1)) for i in range(target_len)]
+
+
+
 def _resample_points(points: List[List[float]], target_len: int) -> List[List[float]]:
     if target_len <= 0 or not points:
         return []
@@ -1122,7 +1139,6 @@ def _compute_pointwise_metrics(
     *,
     horizons: Sequence[Tuple[str, float]],
     step_sec: float,
-    miss_threshold: float,
     dist_fn: Any,
     failure_threshold: Optional[float] = None,
 ) -> Dict[str, Optional[float]]:
@@ -1138,11 +1154,7 @@ def _compute_pointwise_metrics(
     if not dists:
         return {}
 
-    metrics: Dict[str, Optional[float]] = {
-        "ADE_avg": sum(dists) / n,
-        "FDE": dists[-1],
-        "missRate_2": 1.0 if max(dists) > miss_threshold else 0.0,
-    }
+    metrics: Dict[str, Optional[float]] = {}
 
     step_sec = max(float(step_sec), 1e-6)
     steps_per_sec = max(1, int(round(1.0 / step_sec)))
@@ -1167,6 +1179,18 @@ def _compute_pointwise_metrics(
                 metrics[key] = None
 
     return metrics
+
+
+def _average_horizon_metrics(
+    horizon_metrics: Dict[str, Optional[float]],
+    horizon_keys: Sequence[str],
+) -> Optional[float]:
+    if not horizon_keys:
+        return None
+    values = [horizon_metrics.get(key) for key in horizon_keys]
+    if any(v is None for v in values):
+        return None
+    return float(sum(v for v in values if v is not None)) / len(values)
 
 
 def _load_pose_timestamps(seq_dir: Path) -> List[int]:
@@ -1375,25 +1399,18 @@ def _compute_adapter_metrics(
 
     metrics: List[Dict[str, Any]] = []
     sample_rows: Dict[str, List[Dict[str, Any]]] = {}
-    total = len(items)
+    horizon_keys = [f"ADE_{label}s" for label, _ in horizons]
     for adapter in adapters:
-        sum_ade_xy = 0.0
-        sum_ade_xyz = 0.0
-        sum_fde_xy = 0.0
-        sum_fde_xyz = 0.0
-        sum_coverage = 0.0
-        hits_xy = 0
-        hits_xyz = 0
-        valid = 0
         rows: List[Dict[str, Any]] = []
 
-        point_valid = 0
-        sum_ade_avg = 0.0
-        sum_fde = 0.0
-        miss_count = 0
-        failure_count = 0
-        horizon_sums: Dict[str, float] = {f"ADE_{label}s": 0.0 for label, _ in horizons}
-        horizon_counts: Dict[str, int] = {key: 0 for key in horizon_sums}
+        horizon_sums_xy: Dict[str, float] = {key: 0.0 for key in horizon_keys}
+        horizon_counts_xy: Dict[str, int] = {key: 0 for key in horizon_keys}
+        horizon_sums_xyz: Dict[str, float] = {key: 0.0 for key in horizon_keys}
+        horizon_counts_xyz: Dict[str, int] = {key: 0 for key in horizon_keys}
+        point_valid_xy = 0
+        point_valid_xyz = 0
+        failure_count_xy = 0
+        failure_count_xyz = 0
 
         for item in items:
             out = results_by_model.get(adapter.name, {}).get(item.key)
@@ -1410,75 +1427,79 @@ def _compute_adapter_metrics(
             s_gt_end = s_gt[-1]
             if s_gt_end <= 1e-6:
                 continue
-            s_pred = _cumulative_distances_xy(pred)
-            s_pred_end = s_pred[-1] if s_pred else 0.0
-            coverage_ratio = s_pred_end / s_gt_end
-
-            valid += 1
 
             step_sec = float(item_step_sec.get(item.key, traj_step_sec))
-            point_metrics = _compute_pointwise_metrics(
-                pred,
+            aligned_pred = pred
+            if len(pred) >= 2 and len(pred) != len(gt):
+                aligned_pred = _resample_points_by_index(pred, len(gt))
+            point_metrics_xy = _compute_pointwise_metrics(
+                aligned_pred,
                 gt,
                 horizons=horizons,
                 step_sec=step_sec,
-                miss_threshold=2.0,
                 dist_fn=_l2_point_xy,
                 failure_threshold=failure_threshold,
             )
-            if point_metrics:
-                ade_avg = point_metrics.get("ADE_avg")
-                fde = point_metrics.get("FDE")
-                if ade_avg is not None and fde is not None:
-                    point_valid += 1
-                    sum_ade_avg += float(ade_avg)
-                    sum_fde += float(fde)
-                    miss_val = point_metrics.get("missRate_2")
-                    if miss_val is not None:
-                        miss_count += int(miss_val > 0.0)
-                    failure_val = point_metrics.get("failure_1s")
-                    if failure_val is not None:
-                        failure_count += int(failure_val > 0.0)
-                    for key in horizon_sums:
-                        val = point_metrics.get(key)
-                        if val is not None:
-                            horizon_sums[key] += float(val)
-                            horizon_counts[key] += 1
+            point_metrics_xyz = _compute_pointwise_metrics(
+                aligned_pred,
+                gt,
+                horizons=horizons,
+                step_sec=step_sec,
+                dist_fn=_l2_point_xyz,
+                failure_threshold=failure_threshold,
+            )
+            if point_metrics_xy:
+                failure_val = point_metrics_xy.get("failure_1s")
+                if failure_val is not None:
+                    point_valid_xy += 1
+                    if failure_val > 0.0:
+                        failure_count_xy += 1
+                for key in horizon_keys:
+                    val = point_metrics_xy.get(key)
+                    if val is not None:
+                        horizon_sums_xy[key] += float(val)
+                        horizon_counts_xy[key] += 1
 
-            gt_len = len(gt)
-            total_xy = 0.0
-            total_xyz = 0.0
-            max_xy = 0.0
-            max_xyz = 0.0
-            for gt_p, s in zip(gt, s_gt):
-                pred_p = _interp_at_s(pred, s, s_pred)
-                d_xy = _l2_point_xy(gt_p, pred_p)
-                d_xyz = _l2_point_xyz(gt_p, pred_p)
-                total_xy += d_xy
-                total_xyz += d_xyz
-                if d_xy > max_xy:
-                    max_xy = d_xy
-                if d_xyz > max_xyz:
-                    max_xyz = d_xyz
-
-            ade_xy = total_xy / gt_len
-            ade_xyz = total_xyz / gt_len
-            pred_last = _interp_at_s(pred, s_gt_end, s_pred)
-            fde_xy = _l2_point_xy(gt[-1], pred_last)
-            fde_xyz = _l2_point_xyz(gt[-1], pred_last)
-            sum_ade_xy += ade_xy
-            sum_ade_xyz += ade_xyz
-            sum_fde_xy += fde_xy
-            sum_fde_xyz += fde_xyz
-            sum_coverage += coverage_ratio
-            hit_xy = max_xy < hit_threshold
-            hit_xyz = max_xyz < hit_threshold
-            if hit_xy:
-                hits_xy += 1
-            if hit_xyz:
-                hits_xyz += 1
+            if point_metrics_xyz:
+                failure_val = point_metrics_xyz.get("failure_1s")
+                if failure_val is not None:
+                    point_valid_xyz += 1
+                    if failure_val > 0.0:
+                        failure_count_xyz += 1
+                for key in horizon_keys:
+                    val = point_metrics_xyz.get(key)
+                    if val is not None:
+                        horizon_sums_xyz[key] += float(val)
+                        horizon_counts_xyz[key] += 1
 
             if collect_samples:
+                s_pred = _cumulative_distances_xy(pred)
+                s_pred_end = s_pred[-1] if s_pred else 0.0
+                coverage_ratio = s_pred_end / s_gt_end
+
+                gt_len = len(gt)
+                total_xy = 0.0
+                total_xyz = 0.0
+                max_xy = 0.0
+                max_xyz = 0.0
+                for gt_p, s in zip(gt, s_gt):
+                    pred_p = _interp_at_s(pred, s, s_pred)
+                    d_xy = _l2_point_xy(gt_p, pred_p)
+                    d_xyz = _l2_point_xyz(gt_p, pred_p)
+                    total_xy += d_xy
+                    total_xyz += d_xyz
+                    if d_xy > max_xy:
+                        max_xy = d_xy
+                    if d_xyz > max_xyz:
+                        max_xyz = d_xyz
+
+                ade_xy = total_xy / gt_len
+                ade_xyz = total_xyz / gt_len
+                pred_last = _interp_at_s(pred, s_gt_end, s_pred)
+                fde_xy = _l2_point_xy(gt[-1], pred_last)
+                fde_xyz = _l2_point_xyz(gt[-1], pred_last)
+                hit_xy = max_xy < hit_threshold
+                hit_xyz = max_xyz < hit_threshold
                 row = {
                     "key": item.key,
                     "gt_len": gt_len,
@@ -1496,39 +1517,37 @@ def _compute_adapter_metrics(
                     "hit_xyz": hit_xyz,
                     "point_step_sec": step_sec,
                 }
-                if point_metrics:
-                    row.update(point_metrics)
+                if point_metrics_xy:
+                    row.update({f"{key}_xy": val for key, val in point_metrics_xy.items()})
+                if point_metrics_xyz:
+                    row.update({f"{key}_xyz": val for key, val in point_metrics_xyz.items()})
                 rows.append(row)
 
-        horizon_metrics: Dict[str, Optional[float]] = {}
-        for key, total_val in horizon_sums.items():
-            count = horizon_counts[key]
-            horizon_metrics[key] = (total_val / count) if count else None
+        horizon_metrics_xy: Dict[str, Optional[float]] = {}
+        for key, total_val in horizon_sums_xy.items():
+            count = horizon_counts_xy[key]
+            horizon_metrics_xy[key] = (total_val / count) if count else None
 
-        failure_rate = (failure_count / point_valid) if point_valid else None
-        metrics.append(
-            {
-                "adapter": adapter.name,
-                "total_samples": total,
-                "valid_samples": valid,
-                "failure_rate": failure_rate,
-                "ADE_xy": (sum_ade_xy / valid) if valid else None,
-                "FDE_xy": (sum_fde_xy / valid) if valid else None,
-                "HitRate_xy": (hits_xy / valid) if valid else None,
-                "ADE_xyz": (sum_ade_xyz / valid) if valid else None,
-                "FDE_xyz": (sum_fde_xyz / valid) if valid else None,
-                "HitRate_xyz": (hits_xyz / valid) if valid else None,
-                "Coverage_ratio": (sum_coverage / valid) if valid else None,
-                "ADE_avg": (sum_ade_avg / point_valid) if point_valid else None,
-                "FDE": (sum_fde / point_valid) if point_valid else None,
-                "missRate_2": (miss_count / point_valid) if point_valid else None,
-                **horizon_metrics,
-                "hit_threshold": hit_threshold,
-                "failure_threshold_1s": failure_threshold,
-                "frames_per_point": frames_per_point,
-                "default_traj_step_sec": traj_step_sec,
-            }
-        )
+        horizon_metrics_xyz: Dict[str, Optional[float]] = {}
+        for key, total_val in horizon_sums_xyz.items():
+            count = horizon_counts_xyz[key]
+            horizon_metrics_xyz[key] = (total_val / count) if count else None
+
+        failure_rate_xy = (failure_count_xy / point_valid_xy) if point_valid_xy else None
+        failure_rate_xyz = (failure_count_xyz / point_valid_xyz) if point_valid_xyz else None
+        ade_avg_xy = _average_horizon_metrics(horizon_metrics_xy, horizon_keys)
+        ade_avg_xyz = _average_horizon_metrics(horizon_metrics_xyz, horizon_keys)
+
+        entry: Dict[str, Any] = {"adapter": adapter.name}
+        for key in horizon_keys:
+            entry[f"{key}_xy"] = horizon_metrics_xy.get(key)
+        entry["ADE_avg_xy"] = ade_avg_xy
+        entry["failure_rate_xy"] = failure_rate_xy
+        for key in horizon_keys:
+            entry[f"{key}_xyz"] = horizon_metrics_xyz.get(key)
+        entry["ADE_avg_xyz"] = ade_avg_xyz
+        entry["failure_rate_xyz"] = failure_rate_xyz
+        metrics.append(entry)
 
         if collect_samples:
             sample_rows[adapter.name] = rows
@@ -2374,27 +2393,38 @@ def main() -> int:
         for entry in metrics:
             parts = [
                 f"adapter={entry['adapter']}",
-                f"ADE_avg={entry['ADE_avg']:.3f}" if entry.get("ADE_avg") is not None else "ADE_avg=n/a",
-                f"FDE={entry['FDE']:.3f}" if entry.get("FDE") is not None else "FDE=n/a",
-                f"missRate_2={entry['missRate_2']:.3f}" if entry.get("missRate_2") is not None else "missRate_2=n/a",
             ]
             for key in horizon_keys:
-                val = entry.get(key)
+                val = entry.get(f"{key}_xy")
                 if val is not None:
-                    parts.append(f"{key}={val:.3f}")
+                    parts.append(f"{key}_xy={val:.3f}")
                 else:
-                    parts.append(f"{key}=n/a")
-            parts.extend(
-                [
-                    f"ADE_xy={entry['ADE_xy']:.3f}" if entry.get("ADE_xy") is not None else "ADE_xy=n/a",
-                    f"FDE_xy={entry['FDE_xy']:.3f}" if entry.get("FDE_xy") is not None else "FDE_xy=n/a",
-                    f"HitRate_xy={entry['HitRate_xy']:.3f}" if entry.get("HitRate_xy") is not None else "HitRate_xy=n/a",
-                    f"ADE_xyz={entry['ADE_xyz']:.3f}" if entry.get("ADE_xyz") is not None else "ADE_xyz=n/a",
-                    f"FDE_xyz={entry['FDE_xyz']:.3f}" if entry.get("FDE_xyz") is not None else "FDE_xyz=n/a",
-                    f"HitRate_xyz={entry['HitRate_xyz']:.3f}" if entry.get("HitRate_xyz") is not None else "HitRate_xyz=n/a",
-                    f"Coverage={entry['Coverage_ratio']:.3f}" if entry.get("Coverage_ratio") is not None else "Coverage=n/a",
-                    f"failure_rate={entry['failure_rate']:.3f}" if entry.get("failure_rate") is not None else "failure_rate=n/a",
-                ]
+                    parts.append(f"{key}_xy=n/a")
+            parts.append(
+                f"ADE_avg_xy={entry['ADE_avg_xy']:.3f}"
+                if entry.get("ADE_avg_xy") is not None
+                else "ADE_avg_xy=n/a"
+            )
+            parts.append(
+                f"failure_rate_xy={entry['failure_rate_xy']:.3f}"
+                if entry.get("failure_rate_xy") is not None
+                else "failure_rate_xy=n/a"
+            )
+            for key in horizon_keys:
+                val = entry.get(f"{key}_xyz")
+                if val is not None:
+                    parts.append(f"{key}_xyz={val:.3f}")
+                else:
+                    parts.append(f"{key}_xyz=n/a")
+            parts.append(
+                f"ADE_avg_xyz={entry['ADE_avg_xyz']:.3f}"
+                if entry.get("ADE_avg_xyz") is not None
+                else "ADE_avg_xyz=n/a"
+            )
+            parts.append(
+                f"failure_rate_xyz={entry['failure_rate_xyz']:.3f}"
+                if entry.get("failure_rate_xyz") is not None
+                else "failure_rate_xyz=n/a"
             )
             print("[METRICS] " + " ".join(parts))
 
