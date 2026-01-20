@@ -2266,6 +2266,7 @@ def main() -> int:
     if not items:
         raise SystemExit("No samples with valid GT trajectories found.")
 
+    est_frames_by_seq: Dict[str, int] = {}
     if bool(args.estimate_frames_per_point) or bool(args.auto_frames_per_point):
         est_k, rows = _estimate_frames_per_point_from_items(
             items,
@@ -2290,8 +2291,13 @@ def main() -> int:
                         + f"frame_disp={row.get('frame_disp'):.3f} "
                         + f"traj_step={row.get('traj_step'):.3f}"
                     )
+                for row in rows:
+                    seq = row.get("seq")
+                    k = row.get("frames_per_point")
+                    if seq and k:
+                        est_frames_by_seq[str(seq)] = int(k)
             if bool(args.auto_frames_per_point):
-                print(f"[ESTIMATE] overriding --frames-per-point={est_k}")
+                print(f"[ESTIMATE] using per-sequence frames_per_point when available (fallback={est_k})")
                 args.frames_per_point = int(est_k)
 
     results_by_model: Dict[str, Dict[str, ModelOutput]] = {}
@@ -2361,15 +2367,19 @@ def main() -> int:
     item_step_sec: Dict[str, float] = {}
     for item in items:
         step_sec = float(args.traj_step_sec)
-        if frames_per_point > 0:
-            seq_dir = _infer_seq_dir_for_item(item, orad_root=args.orad_root)
-            if seq_dir is not None:
-                step_sec = _get_seq_point_step_sec(
-                    seq_dir,
-                    frames_per_point=frames_per_point,
-                    fallback=step_sec,
-                    cache=seq_step_cache,
-                )
+        seq_dir = _infer_seq_dir_for_item(item, orad_root=args.orad_root)
+        frames_per_point_item = frames_per_point
+        if seq_dir is not None:
+            seq_key = seq_dir.name
+            if seq_key in est_frames_by_seq:
+                frames_per_point_item = est_frames_by_seq[seq_key]
+        if frames_per_point_item > 0 and seq_dir is not None:
+            step_sec = _get_seq_point_step_sec(
+                seq_dir,
+                frames_per_point=frames_per_point_item,
+                fallback=step_sec,
+                cache=seq_step_cache,
+            )
         item_step_sec[item.key] = step_sec
 
     horizon_keys = [f"ADE_{label}s" for label, _ in horizons]
