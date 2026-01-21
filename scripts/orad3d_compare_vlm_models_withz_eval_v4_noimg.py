@@ -15,9 +15,9 @@ Use --projection simple to fall back to the ego-plane scaling overlay.
 Example:
 python scripts/orad3d_compare_vlm_models_withz_eval_v4_noimg.py \
   --base-model Qwen/Qwen3-VL-2B-Instruct \
-  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-3654 \
-  --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_8/checkpoint-3654 \
-  --adapter orpo=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo_first/checkpoint-182 \
+  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-522 \
+  --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_8/checkpoint-522 \
+  --adapter orpo=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2/checkpoint-522 \
   --orad-root /home/work/datasets/bg/ORAD-3D \
   --split testing --image-folder image_data --num-samples 5 \
   --out-dir /home/work/byounggun/LlamaFactory/orad3d_compare_models_withz \
