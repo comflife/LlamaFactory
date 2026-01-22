@@ -11,7 +11,7 @@ Examples
   --dataset-root /home/work/datasets/bg/ORAD-3D --split testing --scene y0602_1309 \
   --mode topdown --save-dir occupancy_plots \
   --path-source local_path_ins --path-frame local \
-  --grid-axis auto --debug
+  --grid-axis auto --occ-all --require-local-path
 
 """
 
@@ -26,6 +26,28 @@ import sys
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
+
+DEFAULT_LABELS = [
+    "road",
+    "safe-road",
+    "car",
+    "people",
+    "water",
+    "snow",
+    "grass-on-road",
+    "rock",
+]
+
+DEFAULT_LABEL_COLORS = {
+    0: (0.45, 0.45, 0.45),  # road - gray
+    1: (0.60, 0.20, 0.80),  # safe-road - purple
+    2: (0.85, 0.10, 0.10),  # car - red
+    3: (1.00, 0.85, 0.10),  # people - yellow
+    4: (0.10, 0.40, 0.90),  # water - blue
+    5: (0.95, 0.95, 0.95),  # snow - white
+    6: (0.10, 0.70, 0.20),  # grass-on-road - green
+    7: (0.55, 0.35, 0.20),  # rock - brown
+}
 
 
 def _split_floats(line: str) -> List[float]:
@@ -180,14 +202,14 @@ def _load_local_path(local_path_dir: str, ts: str, key: str) -> Optional[np.ndar
         arr = np.concatenate([arr, np.zeros((arr.shape[0], 1), dtype=np.float32)], axis=1)
     return arr[:, :3]
 
-def _find_nearest_local_path(local_path_dir: str, ts: str, key: str) -> Optional[np.ndarray]:
+def _find_nearest_local_path(local_path_dir: str, ts: str, key: str) -> Tuple[Optional[np.ndarray], Optional[str], Optional[float]]:
     try:
         target = float(ts)
     except ValueError:
-        return None
+        return None, None, None
     files = glob.glob(os.path.join(local_path_dir, "*.json"))
     if not files:
-        return None
+        return None, None, None
     best = None
     best_diff = None
     for fp in files:
@@ -201,8 +223,15 @@ def _find_nearest_local_path(local_path_dir: str, ts: str, key: str) -> Optional
             best = stem
             best_diff = diff
     if best is None:
-        return None
-    return _load_local_path(local_path_dir, best, key)
+        return None, None, None
+    path = _load_local_path(local_path_dir, best, key)
+    if best_diff is None:
+        return path, best, None
+    if target > 1e6:
+        dt_s = best_diff / 1000.0
+    else:
+        dt_s = best_diff
+    return path, best, dt_s
 
 
 
@@ -304,6 +333,21 @@ def _grid_from_occ_points(
         flat[key_sorted[first]] = lab_sorted[first]
     return flat.reshape((h, w)), flat.reshape((h, w))
 
+def _add_label_legend(ax, labels: np.ndarray, label_names: Dict[int, str],
+                      label_colors: Dict[int, Tuple[float, float, float]]) -> None:
+    try:
+        from matplotlib.patches import Patch
+    except Exception:
+        return
+    uniq = sorted({int(x) for x in np.unique(labels) if int(x) >= 0})
+    handles = []
+    for lab in uniq:
+        name = label_names.get(lab, f"class_{lab}")
+        color = label_colors.get(lab, (0.6, 0.6, 0.6))
+        handles.append(Patch(facecolor=color, edgecolor="none", label=name))
+    if handles:
+        ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=8)
+
 
 def _parse_label_map(path: Optional[str]) -> Dict[int, Tuple[float, float, float]]:
     if not path:
@@ -378,6 +422,9 @@ def _plot_topdown(
     path_width: float,
     path_color: Optional[str],
     path_gradient: bool,
+    label_names: Optional[Dict[int, str]] = None,
+    label_legend: bool = False,
+    label_colors: Optional[Dict[int, Tuple[float, float, float]]] = None,
 ) -> None:
     try:
         import matplotlib.pyplot as plt
@@ -390,6 +437,7 @@ def _plot_topdown(
         raise ValueError("topdown-axes must be one of: xy, yx, xz, zx, yz, zy")
 
     fig, ax = plt.subplots(figsize=(7, 7))
+    label_grid_for_path = None
 
     if occ.shape != (1, 1, 1):
         axis_map = {"x": 0, "y": 1, "z": 2}
@@ -403,9 +451,29 @@ def _plot_topdown(
         ax.imshow(img, cmap=cmap, origin="lower")
     elif points_are_grid and occ_points is not None:
         grid, label_grid = _grid_from_occ_points(occ_points, occ_labels, label_proj)
+        label_grid_for_path = label_grid
         if use_labels and label_grid is not None:
-            rgba = _labels_to_rgba(label_grid.T, label_map, label_alpha)
+            palette = dict(label_colors) if label_colors else dict(label_map)
+            base = [
+                (0.65, 0.65, 0.65),
+                (0.55, 0.12, 0.66),
+                (0.12, 0.47, 0.71),
+                (0.20, 0.63, 0.17),
+                (0.89, 0.10, 0.11),
+                (1.00, 0.50, 0.05),
+                (0.60, 0.31, 0.64),
+                (0.65, 0.81, 0.89),
+                (0.70, 0.87, 0.54),
+                (0.98, 0.60, 0.60),
+            ]
+            uniq = [int(x) for x in np.unique(label_grid) if int(x) >= 0]
+            for idx, lab in enumerate(uniq):
+                if lab not in palette:
+                    palette[lab] = base[idx % len(base)]
+            rgba = _labels_to_rgba(label_grid.T, palette, label_alpha)
             ax.imshow(rgba, origin="lower")
+            if label_legend and label_names:
+                _add_label_legend(ax, label_grid, label_names, palette)
         else:
             cmap = ListedColormap(["white", "#7a7a7a"])
             ax.imshow(grid.T, cmap=cmap, origin="lower")
@@ -424,6 +492,30 @@ def _plot_topdown(
         ax.scatter(path_xy[0, 0], path_xy[0, 1], color="green", s=25, label="start")
         ax.scatter(path_xy[-1, 0], path_xy[-1, 1], color="orange", s=25, label="end")
 
+        if use_labels and label_grid_for_path is not None and axes in ("xy", "yx"):
+            highlight_ids = {2, 3, 4, 5, 7}  # car, people, water, snow, rock
+            xi = np.rint(path_xy[:, 0]).astype(int)
+            yi = np.rint(path_xy[:, 1]).astype(int)
+            if axes == "xy":
+                gx, gy = xi, yi
+            else:
+                gx, gy = yi, xi
+            valid = (gx >= 0) & (gy >= 0) & (gx < label_grid_for_path.shape[0]) & (gy < label_grid_for_path.shape[1])
+            if np.any(valid):
+                labels_at_path = label_grid_for_path[gx[valid], gy[valid]].astype(int)
+                hit = np.isin(labels_at_path, list(highlight_ids))
+                if np.any(hit):
+                    hit_xy = path_xy[valid][hit]
+                    ax.scatter(
+                        hit_xy[:, 0],
+                        hit_xy[:, 1],
+                        s=28,
+                        facecolors="none",
+                        edgecolors="red",
+                        linewidths=1.2,
+                        label="path on non-road",
+                    )
+
     ax.set_title(title)
     ax.set_xlabel(axes[0])
     ax.set_ylabel(axes[1])
@@ -434,6 +526,7 @@ def _plot_topdown(
         plt.savefig(save, dpi=200)
     else:
         plt.show()
+
 
 
 def _find_poses(scene_dir: str) -> Optional[str]:
@@ -467,6 +560,104 @@ def _load_pose_transform(path: Optional[str]) -> Optional[np.ndarray]:
         return T
     raise ValueError("pose transform must have 12 or 16 floats")
 
+def _load_label_map(
+    path: Optional[str],
+) -> Tuple[Dict[int, str], Dict[int, Tuple[float, float, float]]]:
+    if not path:
+        return {}, {}
+    ext = os.path.splitext(path)[1].lower()
+    label_names: Dict[int, str] = {}
+    label_colors: Dict[int, Tuple[float, float, float]] = {}
+
+    if ext == ".json":
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "labels" in data:
+            labels_data = data["labels"]
+        else:
+            labels_data = data
+
+        if isinstance(labels_data, list):
+            for idx, name in enumerate(labels_data):
+                label_names[int(idx)] = str(name)
+        elif isinstance(labels_data, dict):
+            for key, val in labels_data.items():
+                label_names[int(key)] = str(val)
+
+        if isinstance(data, dict) and "colors" in data and isinstance(data["colors"], dict):
+            for key, val in data["colors"].items():
+                rgb = [float(x) for x in val]
+                if max(rgb) > 1.0:
+                    rgb = [x / 255.0 for x in rgb]
+                label_colors[int(key)] = (rgb[0], rgb[1], rgb[2])
+        return label_names, label_colors
+
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            label_id = int(parts[0])
+            name = parts[1] if len(parts) >= 2 else f"class_{label_id}"
+            label_names[label_id] = name
+            if len(parts) >= 5:
+                rgb = [float(x) for x in parts[2:5]]
+                if max(rgb) > 1.0:
+                    rgb = [x / 255.0 for x in rgb]
+                label_colors[label_id] = (rgb[0], rgb[1], rgb[2])
+    return label_names, label_colors
+
+
+def _default_label_colors() -> List[Tuple[float, float, float]]:
+    return [
+        (0.65, 0.65, 0.65),
+        (0.55, 0.12, 0.66),
+        (0.12, 0.47, 0.71),
+        (0.20, 0.63, 0.17),
+        (0.89, 0.10, 0.11),
+        (1.00, 0.50, 0.05),
+        (0.60, 0.31, 0.64),
+        (0.65, 0.81, 0.89),
+        (0.70, 0.87, 0.54),
+        (0.98, 0.60, 0.60),
+    ]
+
+
+def _resolve_label_colors(
+    labels: np.ndarray,
+    label_colors: Dict[int, Tuple[float, float, float]],
+) -> Dict[int, Tuple[float, float, float]]:
+    uniq = sorted({int(x) for x in np.unique(labels)})
+    palette = dict(label_colors)
+    base = _default_label_colors()
+    for idx, lab in enumerate(uniq):
+        if lab not in palette:
+            palette[lab] = base[idx % len(base)]
+    return palette
+
+
+def _add_label_legend(
+    ax,
+    labels: np.ndarray,
+    label_names: Dict[int, str],
+    label_colors: Dict[int, Tuple[float, float, float]],
+) -> None:
+    try:
+        from matplotlib.patches import Patch
+    except Exception:
+        return
+
+    uniq = sorted({int(x) for x in np.unique(labels)})
+    handles = []
+    for lab in uniq:
+        name = label_names.get(lab, f"class_{lab}")
+        color = label_colors.get(lab, (0.6, 0.6, 0.6))
+        handles.append(Patch(facecolor=color, edgecolor="none", label=name))
+    if handles:
+        ax.legend(handles=handles, loc="upper right", frameon=True, fontsize=8)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Visualize ORAD-3D occupancy GT with path")
@@ -476,6 +667,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--all", action="store_true", help="process all scenes with occupancy+poses")
     parser.add_argument("--num-samples", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-label-legend", dest="label_legend", action="store_false")
+    parser.set_defaults(label_legend=True)
 
     parser.add_argument("--occ-pattern", help="glob pattern inside occupancy dir (e.g. *.npz)")
     parser.add_argument("--occ-index", type=int, default=0)
@@ -500,6 +693,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--local-path-nearest", dest="local_path_nearest", action="store_true", default=True)
     parser.add_argument("--no-local-path-nearest", dest="local_path_nearest", action="store_false")
+    parser.add_argument("--local-path-max-dt", type=float, default=0.5, help="max seconds for nearest local_path")
+    parser.add_argument("--require-local-path", action="store_true", help="skip frames without local_path in range")
     parser.add_argument("--path-frame", default="local", choices=("local", "global"))
     parser.add_argument("--path-axis-order", default="xyz", choices=("xyz", "xzy", "yxz", "yzx", "zxy", "zyx"))
     parser.add_argument("--path-scale", type=float, default=1.0, help="scale path units")
@@ -535,6 +730,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    label_names, label_colors = _load_label_map(args.label_map)
+
+    if not label_names:
+        label_names = {i: n for i, n in enumerate(DEFAULT_LABELS)}
+    if not label_colors:
+        label_colors = DEFAULT_LABEL_COLORS
+
+
 
     split_dir = os.path.join(args.dataset_root, args.split)
     if not os.path.isdir(split_dir):
@@ -626,9 +829,19 @@ def main() -> int:
                     "local_path_hmi_past": "trajectory_hmi_past",
                 }
                 key = key_map.get(args.path_source, "trajectory_ins")
+                local_used = None
+                local_dt = None
                 path = _load_local_path(local_dir, occ_ts, key)
-                if path is None and args.local_path_nearest:
-                    path = _find_nearest_local_path(local_dir, occ_ts, key)
+                if path is not None:
+                    local_used = occ_ts
+                    local_dt = 0.0
+                if args.debug and local_used is not None:
+                    print(f"[{scene} {occ_ts}] local_path ts={local_used} dt={local_dt:.3f}s", file=sys.stderr)
+
+            if path is None and args.require_local_path:
+                if args.debug:
+                    print(f"[{scene} {occ_ts}] skip: no local_path", file=sys.stderr)
+                continue
 
             if path is None:
                 poses, timestamps, rpy = load_poses_with_meta(poses_path)
@@ -707,6 +920,10 @@ def main() -> int:
                 path_width=args.path_width,
                 path_color=None if args.path_gradient else args.path_color,
                 path_gradient=args.path_gradient,
+                label_names=label_names,
+                label_colors=label_colors,
+                label_legend=args.label_legend,
+
             )
 
 
