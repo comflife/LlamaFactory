@@ -1,0 +1,1163 @@
+#!/usr/bin/env python3
+"""Build multimodal preference datasets (ORPO/DPO-style or KTO-style) for LLaMAFactory VLM fine-tuning.
+
+python3 scripts/orad3d_build_vlm_orpo_v2.py \
+  --orad-root /home/work/datasets/bg/ORAD-3D \
+  --splits training validation testing \
+  --image-folder image_data \
+  --trajectory-key trajectory_ins \
+  --num-points 8 \
+  --relative-media \
+  --media-root /home/work/datasets/bg/ORAD-3D \
+  --orpo \
+  --out /home/work/datasets/bg/orad3d_orpo3/orad3d_train_orpo.jsonl \
+  --write-dataset-info \
+  --dataset-name orad3d_orpo3
+
+
+python3 scripts/orad3d_build_vlm_orpo_v2.py \
+  --orad-root /home/work/datasets/bg/ORAD-3D \
+  --splits training validation testing \
+  --image-folder image_data \
+  --trajectory-key trajectory_ins \
+  --num-points 8 \
+  --relative-media \
+  --media-root /home/work/datasets/bg/ORAD-3D \
+  --orpo \
+  --reject-z-flip \
+  --reject-z-pivot start \
+  --reject-z-margin 0.05 \
+  --reject-z-min-delta 1e-4 \
+  --allow-negative-fallback \
+  --out /home/work/datasets/bg/orad3d_orpo3/orad3d_train_orpo.jsonl \
+  --write-dataset-info \
+  --dataset-name orad3d_orpo3
+
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import random
+import re
+import math
+import sys
+import statistics
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import Iterable, Iterator, List, Literal, Tuple
+
+
+_TS_RE = re.compile(r"^(?P<ts>\d+)")
+
+
+def _tqdm(iterable, *, enabled: bool, **kwargs):
+    if not enabled:
+        return iterable
+    try:
+        from tqdm.auto import tqdm  # type: ignore
+
+        return tqdm(iterable, **kwargs)
+    except Exception:
+        return iterable
+
+
+@dataclass(frozen=True)
+class BuildOptions:
+    orad_root: Path
+    splits: tuple[str, ...]
+    out_path: Path
+    image_folder: str
+    prompt_text: str
+    system_text: str
+    trajectory_key: str
+    num_points: int
+    relative_media: bool
+    media_root: Path
+    max_samples: int | None
+    max_per_sequence: int | None
+    write_dataset_info: bool
+    dataset_name: str
+
+    preference_format: Literal["none", "kto", "orpo"]
+
+    # Trajectory hard-negative constraints (XY only).
+    min_heading_diff_deg: float | None
+    max_delta_cosine: float | None
+    max_negative_tries: int
+
+    # Negative sampling diversification.
+    wrong_pool_size: int
+    # Training split only: exclude the most-different bottom quantile by XY similarity.
+    train_exclude_bottom_quantile: float
+    seed: int
+
+    # Thresholded negative selection.
+    max_traj_similarity: float | None
+    negative_policy: Literal["most_different", "hard", "z_diff"]
+    negative_source: Literal["same_sequence", "global_pool", "hybrid"]
+    seq_window: int
+    allow_negative_fallback: bool
+    min_z_diff: float | None
+
+    # Synthetic reject: flip z while keeping xy.
+    reject_z_flip: bool
+    reject_z_pivot: Literal["start", "mean", "median"]
+    reject_z_margin: float
+    reject_z_min_delta: float
+
+    # Progress
+    use_tqdm: bool
+
+    # Multi-output mode
+    out_dir: Path | None
+    prefix: str
+
+
+def _extract_timestamp(name: str) -> str | None:
+    match = _TS_RE.match(name)
+    if not match:
+        return None
+    return match.group("ts")
+
+
+def _iter_sequences(split_dir: Path) -> Iterator[Path]:
+    if not split_dir.exists():
+        return
+    for child in sorted(split_dir.iterdir(), key=lambda p: p.name):
+        if child.is_dir():
+            yield child
+
+
+def _choose_points(points: list[list[float]], num_points: int) -> list[list[float]]:
+    if not points:
+        return []
+    # num_points <= 0 means: keep the original full trajectory.
+    if num_points <= 0:
+        return points
+    if len(points) <= num_points:
+        return points
+
+    if num_points == 1:
+        return [points[0]]
+
+    last_idx = len(points) - 1
+    indices = [round(i * last_idx / (num_points - 1)) for i in range(num_points)]
+
+    seen = set()
+    selected: list[list[float]] = []
+    for idx in indices:
+        idx = max(0, min(last_idx, int(idx)))
+        if idx in seen:
+            continue
+        seen.add(idx)
+        selected.append(points[idx])
+
+    while len(selected) < num_points:
+        selected.append(points[last_idx])
+
+    return selected
+
+
+def _format_trajectory(points: list[list[float]]) -> str:
+    formatted = []
+    for p in points:
+        if not isinstance(p, list) or len(p) < 3:
+            continue
+        x, y, z = p[0], p[1], p[2]
+        formatted.append(f"[{x:.3f},{y:.3f},{z:.3f}]")
+    return ",".join(formatted)
+
+
+def _to_xy(points: list[list[float]]) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    for p in points:
+        if not isinstance(p, list) or len(p) < 2:
+            continue
+        out.append((float(p[0]), float(p[1])))
+    return out
+
+
+def _normalize_xy(xy: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    if not xy:
+        return []
+    x0, y0 = xy[0]
+    return [(x - x0, y - y0) for (x, y) in xy]
+
+
+def _heading_angle_rad(xy_norm: list[tuple[float, float]]) -> float | None:
+    if len(xy_norm) < 2:
+        return None
+    dx = xy_norm[-1][0]
+    dy = xy_norm[-1][1]
+    if abs(dx) < 1e-12 and abs(dy) < 1e-12:
+        return None
+    return math.atan2(dy, dx)
+
+
+def _angle_diff_rad(a: float, b: float) -> float:
+    diff = abs(a - b) % (2.0 * math.pi)
+    if diff > math.pi:
+        diff = 2.0 * math.pi - diff
+    return diff
+
+
+def _delta_cosine(xy_norm_a: list[tuple[float, float]], xy_norm_b: list[tuple[float, float]]) -> float | None:
+    if len(xy_norm_a) < 2 or len(xy_norm_b) < 2:
+        return None
+
+    def to_deltas(xy_norm: list[tuple[float, float]]) -> list[float]:
+        flat: list[float] = []
+        for (x0, y0), (x1, y1) in zip(xy_norm[:-1], xy_norm[1:]):
+            flat.append(float(x1 - x0))
+            flat.append(float(y1 - y0))
+        return flat
+
+    a = to_deltas(xy_norm_a)
+    b = to_deltas(xy_norm_b)
+    if len(a) != len(b) or len(a) == 0:
+        return None
+
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(y * y for y in b))
+    if na < 1e-12 or nb < 1e-12:
+        return None
+    return dot / (na * nb)
+
+
+def _trajectory_similarity_xy(xy_norm_a: list[tuple[float, float]], xy_norm_b: list[tuple[float, float]]) -> float:
+    """Return a heuristic similarity in [0, 1] using XY only.
+
+    Higher means more similar. This combines:
+    - Per-step delta cosine similarity
+    - Overall heading similarity (end-to-end direction)
+    """
+    delta_cos = _delta_cosine(xy_norm_a, xy_norm_b)
+    if delta_cos is None:
+        delta_sim = 0.0
+    else:
+        delta_sim = 0.5 * (max(-1.0, min(1.0, float(delta_cos))) + 1.0)
+
+    head_a = _heading_angle_rad(xy_norm_a)
+    head_b = _heading_angle_rad(xy_norm_b)
+    if head_a is None or head_b is None:
+        heading_sim = 0.5
+    else:
+        heading_sim = 0.5 * (math.cos(_angle_diff_rad(head_a, head_b)) + 1.0)
+
+    return max(0.0, min(1.0, 0.8 * delta_sim + 0.2 * heading_sim))
+
+
+def _quantile(values: list[float], q: float) -> float:
+    """Return q-quantile (0..1) using nearest-rank on sorted values."""
+    if not values:
+        return 0.0
+    q = max(0.0, min(1.0, float(q)))
+    sorted_vals = sorted(values)
+    idx = int(round(q * (len(sorted_vals) - 1)))
+    idx = max(0, min(len(sorted_vals) - 1, idx))
+    return float(sorted_vals[idx])
+
+
+def _trajectory_z_diff(
+    points_a: list[list[float]],
+    points_b: list[list[float]],
+    num_points: int,
+) -> float | None:
+    """Return mean absolute z difference over aligned trajectory points."""
+    if not points_a or not points_b:
+        return None
+
+    if num_points > 0:
+        chosen_a = _choose_points(points_a, num_points)
+        chosen_b = _choose_points(points_b, num_points)
+    else:
+        chosen_a = points_a
+        chosen_b = points_b
+
+    if not chosen_a or not chosen_b:
+        return None
+
+    if len(chosen_a) != len(chosen_b):
+        n = min(len(chosen_a), len(chosen_b))
+        if n <= 0:
+            return None
+        chosen_a = _choose_points(points_a, n)
+        chosen_b = _choose_points(points_b, n)
+
+    diffs: list[float] = []
+    for pa, pb in zip(chosen_a, chosen_b):
+        if not isinstance(pa, list) or not isinstance(pb, list) or len(pa) < 3 or len(pb) < 3:
+            continue
+        diffs.append(abs(float(pa[2]) - float(pb[2])))
+
+    if not diffs:
+        return None
+    return float(sum(diffs) / len(diffs))
+
+
+def _z_pivot(points: list[list[float]], mode: str) -> float | None:
+    if not points:
+        return None
+    zs = [float(p[2]) for p in points if isinstance(p, list) and len(p) >= 3]
+    if not zs:
+        return None
+    if mode == "start":
+        return float(zs[0])
+    if mode == "median":
+        return float(statistics.median(zs))
+    return float(sum(zs) / len(zs))
+
+
+def _flip_z_trajectory(points: list[list[float]], *, pivot: float, z_min: float, z_max: float) -> list[list[float]]:
+    out: list[list[float]] = []
+    for p in points:
+        if not isinstance(p, list) or len(p) < 3:
+            continue
+        z_new = 2.0 * pivot - float(p[2])
+        if z_new < z_min:
+            z_new = z_min
+        elif z_new > z_max:
+            z_new = z_max
+        out.append([float(p[0]), float(p[1]), float(z_new)])
+    return out
+
+
+def _max_abs_z_delta(a: list[list[float]], b: list[list[float]]) -> float:
+    if not a or not b:
+        return 0.0
+    n = min(len(a), len(b))
+    if n <= 0:
+        return 0.0
+    max_delta = 0.0
+    for pa, pb in zip(a[:n], b[:n]):
+        if not isinstance(pa, list) or not isinstance(pb, list) or len(pa) < 3 or len(pb) < 3:
+            continue
+        dz = abs(float(pa[2]) - float(pb[2]))
+        if dz > max_delta:
+            max_delta = dz
+    return float(max_delta)
+
+
+def _read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="replace").strip()
+
+
+def _read_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _to_media_path(image_path: Path, opt: BuildOptions) -> str:
+    if not opt.relative_media:
+        return str(image_path)
+    try:
+        return str(image_path.relative_to(opt.media_root))
+    except Exception:
+        return str(image_path)
+
+
+# Collect all valid trajectories (key + points) for wrong sampling in preference modes.
+def _collect_trajectory_pool(opt: BuildOptions) -> List[Tuple[Tuple[str, str, str], list[list[float]]]]:
+    pool = []
+    for split in opt.splits:
+        split_dir = opt.orad_root / split
+        seq_dirs = list(_iter_sequences(split_dir))
+        for seq_dir in _tqdm(
+            seq_dirs,
+            enabled=bool(opt.use_tqdm),
+            desc=f"Collect pool ({split})",
+            unit="seq",
+            leave=False,
+        ):
+            image_dir = seq_dir / opt.image_folder
+            scene_dir = seq_dir / "scene_data_refine"
+            local_dir = seq_dir / "local_path"
+
+            if not (image_dir.exists() and scene_dir.exists() and local_dir.exists()):
+                continue
+
+            for img_path in image_dir.iterdir():
+                if not img_path.is_file():
+                    continue
+                ts = _extract_timestamp(img_path.name)
+                if ts is None:
+                    continue
+
+                scene_path = scene_dir / f"{ts}.txt"
+                local_path = local_dir / f"{ts}.json"
+                if not (scene_path.exists() and local_path.exists()):
+                    continue
+
+                try:
+                    scene_text = _read_text(scene_path)
+                    local_obj = _read_json(local_path)
+                except Exception:
+                    continue
+
+                raw_points = local_obj.get(opt.trajectory_key)
+                if not isinstance(raw_points, list) or len(raw_points) == 0:
+                    continue
+
+                try:
+                    points = [list(map(float, p[:3])) for p in raw_points if isinstance(p, list) and len(p) >= 3]
+                except Exception:
+                    continue
+
+                if len(points) < 2:
+                    continue
+
+                key = (split, seq_dir.name, ts)
+                if not scene_text:
+                    continue
+                pool.append((key, points))
+
+    return pool
+
+
+@dataclass(frozen=True)
+class _SeqItem:
+    key: Tuple[str, str, str]
+    ts_int: int
+    points: list[list[float]]
+
+
+def _collect_sequence_items(seq_dir: Path, split: str, opt: BuildOptions) -> list[_SeqItem]:
+    image_dir = seq_dir / opt.image_folder
+    scene_dir = seq_dir / "scene_data_refine"
+    scene_dir_raw = seq_dir / "scene_data"
+    local_dir = seq_dir / "local_path"
+
+    if not (image_dir.exists() and scene_dir.exists() and local_dir.exists()):
+        return []
+
+    items: list[_SeqItem] = []
+    for img_path in sorted([p for p in image_dir.iterdir() if p.is_file()], key=lambda p: p.name):
+        ts = _extract_timestamp(img_path.name)
+        if ts is None:
+            continue
+
+        scene_path = scene_dir / f"{ts}.txt"
+        local_path = local_dir / f"{ts}.json"
+        if not (scene_path.exists() and local_path.exists()):
+            continue
+
+        try:
+            scene_text = _read_text(scene_path)
+            local_obj = _read_json(local_path)
+        except Exception:
+            continue
+
+        raw_points = local_obj.get(opt.trajectory_key)
+        if not isinstance(raw_points, list) or len(raw_points) == 0:
+            continue
+
+        try:
+            points = [list(map(float, p[:3])) for p in raw_points if isinstance(p, list) and len(p) >= 3]
+        except Exception:
+            continue
+
+        if len(points) < 2 or not scene_text:
+            continue
+
+        try:
+            ts_int = int(ts)
+        except Exception:
+            continue
+
+        items.append(_SeqItem(key=(split, seq_dir.name, ts), ts_int=ts_int, points=points))
+
+    items.sort(key=lambda it: it.ts_int)
+    return items
+
+
+def _choose_negative_from_candidates(
+    *,
+    current_key: Tuple[str, str, str],
+    correct_points: list[list[float]],
+    candidates: list[Tuple[Tuple[str, str, str], list[list[float]]]],
+    opt: BuildOptions,
+) -> Tuple[Tuple[str, str, str] | None, list[list[float]] | None]:
+    if not candidates:
+        return None, None
+
+    if opt.negative_policy == "z_diff":
+        scored: list[tuple[float, Tuple[str, str, str], list[list[float]]]] = []
+        for wrong_key, wrong_raw_points in candidates:
+            if wrong_key == current_key:
+                continue
+            z_diff = _trajectory_z_diff(correct_points, wrong_raw_points, opt.num_points)
+            if z_diff is None:
+                continue
+            scored.append((z_diff, wrong_key, wrong_raw_points))
+
+        scored.sort(key=lambda t: -t[0])  # maximize z difference
+
+        tries = max(1, int(opt.max_negative_tries))
+        for z_diff, wrong_key, wrong_raw_points in scored[: min(tries, len(scored))]:
+            if opt.min_z_diff is not None and float(z_diff) < float(opt.min_z_diff):
+                continue
+            return wrong_key, wrong_raw_points
+
+        if bool(opt.allow_negative_fallback) and scored:
+            _, wrong_key, wrong_raw_points = scored[0]
+            return wrong_key, wrong_raw_points
+
+        return None, None
+
+    correct_xy = _normalize_xy(_to_xy(_choose_points(correct_points, opt.num_points)))
+    correct_heading = _heading_angle_rad(correct_xy)
+
+    scored: list[tuple[float, Tuple[str, str, str], list[list[float]]]] = []
+    for wrong_key, wrong_raw_points in candidates:
+        if wrong_key == current_key:
+            continue
+        wrong_xy = _normalize_xy(_to_xy(_choose_points(wrong_raw_points, opt.num_points)))
+        traj_sim = _trajectory_similarity_xy(correct_xy, wrong_xy)
+        scored.append((traj_sim, wrong_key, wrong_raw_points))
+
+    # NOTE: `traj_sim` is in [0, 1]. Higher => more similar.
+    # - most_different: pick the least similar trajectory (diverse negative).
+    # - hard: pick the most similar trajectory that still passes the thresholds (hard negative).
+    # - z_diff is handled earlier (maximize mean absolute z difference).
+    if opt.negative_policy == "hard":
+        scored.sort(key=lambda t: -t[0])  # maximize traj_sim
+    else:
+        scored.sort(key=lambda t: t[0])  # minimize traj_sim
+
+    # Apply filters after sorting so we can pick the first that satisfies constraints.
+    tries = max(1, int(opt.max_negative_tries))
+    for traj_sim, wrong_key, wrong_raw_points in scored[: min(tries, len(scored))]:
+        wrong_xy = _normalize_xy(_to_xy(_choose_points(wrong_raw_points, opt.num_points)))
+
+        if opt.max_traj_similarity is not None and float(traj_sim) > float(opt.max_traj_similarity):
+            continue
+
+        if opt.min_heading_diff_deg is not None and correct_heading is not None:
+            wrong_heading = _heading_angle_rad(wrong_xy)
+            if wrong_heading is None:
+                continue
+            heading_diff_deg = math.degrees(_angle_diff_rad(correct_heading, wrong_heading))
+            if heading_diff_deg < float(opt.min_heading_diff_deg):
+                continue
+
+        if opt.max_delta_cosine is not None:
+            cos = _delta_cosine(correct_xy, wrong_xy)
+            if cos is not None and cos > float(opt.max_delta_cosine):
+                continue
+
+        return wrong_key, wrong_raw_points
+
+    # Fallback: optionally pick the best-scored candidate even if constraints could not be satisfied.
+    if bool(opt.allow_negative_fallback) and scored:
+        _, wrong_key, wrong_raw_points = scored[0]
+        return wrong_key, wrong_raw_points
+
+    return None, None
+
+
+def _pick_wrong_trajectory(
+    *,
+    current_key: Tuple[str, str, str],
+    correct_points: list[list[float]],
+    traj_pool: List[Tuple[Tuple[str, str, str], list[list[float]]]],
+    opt: BuildOptions,
+) -> Tuple[Tuple[str, str, str] | None, list[list[float]] | None]:
+    if len(traj_pool) <= 1:
+        return None, None
+
+    # Build a candidate subset to avoid repeatedly choosing the same global outlier.
+    pool_wo_self = [(k, pts) for (k, pts) in traj_pool if k != current_key]
+    if not pool_wo_self:
+        return None, None
+
+    k = int(opt.wrong_pool_size)
+    if k <= 0:
+        k = 256
+    k = min(k, len(pool_wo_self))
+    candidates = random.sample(pool_wo_self, k=k)
+
+    # Training split only: exclude the most-different bottom quantile (prevents trivial/global outliers).
+    if current_key[0] == "training" and float(opt.train_exclude_bottom_quantile) > 0.0:
+        correct_xy = _normalize_xy(_to_xy(_choose_points(correct_points, opt.num_points)))
+        sims = []
+        for _, wrong_raw_points in candidates:
+            wrong_xy = _normalize_xy(_to_xy(_choose_points(wrong_raw_points, opt.num_points)))
+            sims.append(_trajectory_similarity_xy(correct_xy, wrong_xy))
+
+        threshold = _quantile(sims, float(opt.train_exclude_bottom_quantile))
+        # Exclude the most different: keep strictly above threshold.
+        filtered = [cand for cand, sim in zip(candidates, sims) if sim > threshold]
+        if filtered:
+            candidates = filtered
+
+    return _choose_negative_from_candidates(
+        current_key=current_key,
+        correct_points=correct_points,
+        candidates=candidates,
+        opt=opt,
+    )
+
+
+def _iter_frame_samples(
+    seq_dir: Path,
+    split: str,
+    opt: BuildOptions,
+    traj_pool: List[Tuple[Tuple[str, str, str], list[list[float]]]],
+) -> Iterator[dict]:
+    image_dir = seq_dir / opt.image_folder
+    scene_dir = seq_dir / "scene_data_refine"
+    scene_dir_raw = seq_dir / "scene_data"
+    local_dir = seq_dir / "local_path"
+
+    if not (image_dir.exists() and scene_dir.exists() and local_dir.exists()):
+        return
+
+    image_files = [p for p in sorted(image_dir.iterdir(), key=lambda p: p.name) if p.is_file()]
+    produced = 0
+
+    current_key_base = (split, seq_dir.name)
+    seq_items: list[_SeqItem] | None = None
+    seq_pos_by_ts: dict[str, int] | None = None
+    if opt.preference_format == "orpo" and opt.negative_source in {"same_sequence", "hybrid"}:
+        seq_items = _collect_sequence_items(seq_dir, split, opt)
+        seq_pos_by_ts = {it.key[2]: i for i, it in enumerate(seq_items)}
+
+    for img_path in image_files:
+        ts = _extract_timestamp(img_path.name)
+        if ts is None:
+            continue
+
+        scene_path = scene_dir / f"{ts}.txt"
+        scene_path_raw = scene_dir_raw / f"{ts}.txt"
+        local_path = local_dir / f"{ts}.json"
+
+        if not (scene_path.exists() and local_path.exists()):
+            continue
+
+        try:
+            scene_text = _read_text(scene_path)
+            local_obj = _read_json(local_path)
+        except Exception:
+            continue
+
+        scene_text_raw = scene_text
+        if scene_path_raw.exists():
+            try:
+                scene_text_raw = _read_text(scene_path_raw)
+            except Exception:
+                scene_text_raw = scene_text
+
+        raw_points = local_obj.get(opt.trajectory_key)
+        if not isinstance(raw_points, list) or len(raw_points) == 0:
+            continue
+
+        try:
+            correct_points = [list(map(float, p[:3])) for p in raw_points if isinstance(p, list) and len(p) >= 3]
+        except Exception:
+            continue
+
+        if len(correct_points) < 2:
+            continue
+
+        current_key = (*current_key_base, ts)
+
+        chosen_correct = _choose_points(correct_points, opt.num_points)
+        traj_correct = _format_trajectory(chosen_correct)
+        if not traj_correct:
+            continue
+
+        assistant_correct = f"{scene_text}\n<trajectory>\n{traj_correct}"
+        user_text = f"<image>\n{opt.prompt_text}"
+
+        base_messages = [
+            {"role": "system", "content": opt.system_text},
+            {"role": "user", "content": user_text},
+        ]
+        images = [_to_media_path(img_path, opt)]
+
+        if opt.preference_format == "none":
+            # Standard supervised (ShareGPT/OpenAI style) example.
+            sample = {
+                "messages": base_messages + [{"role": "assistant", "content": assistant_correct}],
+                "images": images,
+                "meta": {"split": split, "sequence": seq_dir.name, "timestamp": ts},
+            }
+            yield sample
+        elif opt.preference_format == "kto":
+            # KTO: boolean feedback on a single completion.
+            sample = {
+                "messages": base_messages + [{"role": "assistant", "content": assistant_correct}],
+                "images": images,
+                "kto_tag": True,
+                "meta": {"split": split, "sequence": seq_dir.name, "timestamp": ts},
+            }
+            yield sample
+        elif opt.preference_format == "orpo":
+            wrong_key = None
+            wrong_raw_points = None
+            synthetic_reject = False
+
+            if opt.reject_z_flip:
+                pivot = _z_pivot(correct_points, opt.reject_z_pivot)
+                if pivot is not None:
+                    zs = [float(p[2]) for p in correct_points if isinstance(p, list) and len(p) >= 3]
+                    if zs:
+                        z_min = min(zs) - float(opt.reject_z_margin)
+                        z_max = max(zs) + float(opt.reject_z_margin)
+                        candidate = _flip_z_trajectory(correct_points, pivot=pivot, z_min=z_min, z_max=z_max)
+                        if _max_abs_z_delta(correct_points, candidate) >= float(opt.reject_z_min_delta):
+                            wrong_key = current_key
+                            wrong_raw_points = candidate
+                            synthetic_reject = True
+
+            if wrong_raw_points is None:
+                if opt.reject_z_flip and not opt.allow_negative_fallback:
+                    continue
+                # Best-effort: hard negatives from the same sequence/time neighborhood.
+                if seq_items is not None and seq_pos_by_ts is not None:
+                    if opt.negative_policy == "z_diff":
+                        local_candidates = [(it.key, it.points) for it in seq_items if it.key != current_key]
+                    else:
+                        pos = seq_pos_by_ts.get(ts)
+                        if pos is None or opt.seq_window <= 0:
+                            local_candidates = []
+                        else:
+                            lo = max(0, int(pos) - int(opt.seq_window))
+                            hi = min(len(seq_items), int(pos) + int(opt.seq_window) + 1)
+                            local_candidates = [(it.key, it.points) for it in seq_items[lo:hi] if it.key != current_key]
+
+                    if local_candidates:
+                        wrong_key, wrong_raw_points = _choose_negative_from_candidates(
+                            current_key=current_key,
+                            correct_points=correct_points,
+                            candidates=local_candidates,
+                            opt=opt,
+                        )
+
+                # Fallback: global pool (only when requested).
+                if wrong_raw_points is None and opt.negative_source in {"global_pool", "hybrid"}:
+                    wrong_key, wrong_raw_points = _pick_wrong_trajectory(
+                        current_key=current_key,
+                        correct_points=correct_points,
+                        traj_pool=traj_pool,
+                        opt=opt,
+                    )
+            if wrong_raw_points is None:
+                continue
+
+            wrong_chosen = _choose_points(wrong_raw_points, opt.num_points)
+            traj_wrong = _format_trajectory(wrong_chosen)
+            if not traj_wrong:
+                continue
+
+            # Rejected must be conditioned on the *same prompt image*.
+            # Keep the scene description anchored to the current frame and only swap the trajectory.
+            assistant_wrong = f"{scene_text_raw}\n<trajectory>\n{traj_wrong}"
+
+            # Add debug similarities (helps verify thresholds).
+            wrong_xy_norm = _normalize_xy(_to_xy(_choose_points(wrong_raw_points, opt.num_points)))
+            traj_sim = _trajectory_similarity_xy(
+                _normalize_xy(_to_xy(_choose_points(correct_points, opt.num_points))),
+                wrong_xy_norm,
+            )
+            z_diff = _trajectory_z_diff(correct_points, wrong_raw_points, opt.num_points)
+
+            # ORPO/DPO-style preference example: prompt messages end with user (odd turns),
+            # chosen/rejected are assistant messages.
+            sample = {
+                "messages": base_messages,
+                "images": images,
+                "chosen": {"role": "assistant", "content": assistant_correct},
+                "rejected": {"role": "assistant", "content": assistant_wrong},
+                "meta": {
+                    "split": split,
+                    "sequence": seq_dir.name,
+                    "timestamp": ts,
+                    "negative_from": {"split": wrong_key[0], "sequence": wrong_key[1], "timestamp": wrong_key[2]},
+                    "neg_traj_sim": round(float(traj_sim), 6),
+                    "neg_z_diff": round(float(z_diff), 6) if z_diff is not None else None,
+                    "neg_synthetic": bool(synthetic_reject),
+                },
+            }
+            yield sample
+        else:
+            raise ValueError(f"Unknown preference_format: {opt.preference_format}")
+
+        produced += 1
+        if opt.max_per_sequence is not None and produced >= opt.max_per_sequence:
+            return
+
+
+def build_samples(opt: BuildOptions) -> Iterable[dict]:
+    traj_pool = _collect_trajectory_pool(opt) if (opt.preference_format in {"kto", "orpo"} and opt.negative_source in {"global_pool", "hybrid"}) else []
+
+    emitted = 0
+    for split in opt.splits:
+        split_dir = opt.orad_root / split
+        seq_dirs = list(_iter_sequences(split_dir))
+        for seq_dir in _tqdm(
+            seq_dirs,
+            enabled=bool(opt.use_tqdm),
+            desc=f"Build samples ({split})",
+            unit="seq",
+        ):
+            for sample in _iter_frame_samples(seq_dir, split, opt, traj_pool):
+                yield sample
+                emitted += 1
+                if opt.max_samples is not None and emitted >= opt.max_samples:
+                    return
+
+
+def build_split_samples(opt: BuildOptions, split: str) -> Iterable[dict]:
+    """Build samples for a single split.
+
+    - training: ORPO pairwise preference (chosen/rejected)
+    - validation/testing: ShareGPT supervised samples
+    """
+    pref: Literal["none", "kto", "orpo"] = "orpo" if split == "training" else "none"
+    opt_split = replace(opt, splits=(split,), preference_format=pref)
+
+    traj_pool = (
+        _collect_trajectory_pool(opt_split)
+        if (pref in {"kto", "orpo"} and opt_split.negative_source in {"global_pool", "hybrid"})
+        else []
+    )
+
+    split_dir = opt_split.orad_root / split
+    seq_dirs = list(_iter_sequences(split_dir))
+    for seq_dir in _tqdm(
+        seq_dirs,
+        enabled=bool(opt_split.use_tqdm),
+        desc=f"Build samples ({split})",
+        unit="seq",
+    ):
+        for sample in _iter_frame_samples(seq_dir, split, opt_split, traj_pool):
+            yield sample
+
+
+def _write_dataset_info(out_dir: Path, opt: BuildOptions) -> None:
+    info: dict = {
+        opt.dataset_name: {
+            "file_name": opt.out_path.name,
+            "formatting": "sharegpt",
+            "columns": {"messages": "messages", "images": "images"},
+            "tags": {
+                "role_tag": "role",
+                "content_tag": "content",
+                "user_tag": "user",
+                "assistant_tag": "assistant",
+                "system_tag": "system",
+            },
+        }
+    }
+
+    if opt.preference_format == "kto":
+        info[opt.dataset_name]["columns"]["kto_tag"] = "kto_tag"
+    elif opt.preference_format == "orpo":
+        info[opt.dataset_name]["ranking"] = True
+        info[opt.dataset_name]["columns"]["chosen"] = "chosen"
+        info[opt.dataset_name]["columns"]["rejected"] = "rejected"
+
+    # LLaMAFactory loads dataset metadata from `dataset_info.json`.
+    payload = json.dumps(info, ensure_ascii=False, indent=2) + "\n"
+    (out_dir / "dataset_info.json").write_text(payload, encoding="utf-8")
+    # Keep a secondary alias for convenience when inspecting generated artifacts.
+    if opt.preference_format == "orpo":
+        (out_dir / "dataset_info_orpo.json").write_text(payload, encoding="utf-8")
+
+
+def _write_dataset_info_sharegpt_multi(out_dir: Path, datasets: dict[str, str]) -> None:
+    """Write dataset_info.json with multiple ShareGPT datasets.
+
+    Args:
+        datasets: mapping dataset_name -> file_name
+    """
+    info: dict = {}
+    for name, file_name in datasets.items():
+        info[name] = {
+            "file_name": file_name,
+            "formatting": "sharegpt",
+            "columns": {"messages": "messages", "images": "images"},
+            "tags": {
+                "role_tag": "role",
+                "content_tag": "content",
+                "user_tag": "user",
+                "assistant_tag": "assistant",
+                "system_tag": "system",
+            },
+        }
+
+    (out_dir / "dataset_info.json").write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="Build ORAD-3D VLM dataset (ShareGPT/KTO/ORPO) for LLaMAFactory.")
+    ap.add_argument("--orad-root", default="/home/work/datasets/bg/ORAD-3D", help="Root folder containing training/validation/testing")
+    ap.add_argument("--splits", nargs="+", default=["training"], choices=["training", "validation", "testing"])
+    ap.add_argument("--out", default=None, help="Output JSONL path (single-file mode)")
+    ap.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Output directory for multi-split mode. If set, training is written as ORPO JSONL and "
+            "validation/testing are written as ShareGPT JSONL."
+        ),
+    )
+    ap.add_argument(
+        "--prefix",
+        default="orad3d",
+        help="Filename prefix used in --out-dir mode.",
+    )
+    ap.add_argument("--image-folder", default="image_data", choices=["gt_image", "image_data"])
+    ap.add_argument("--prompt", default="I am seeing an off-road driving image. Please generate a safe drivable trajectory for my vehicle to follow.")
+    ap.add_argument("--system", default="You are an off-road autonomous driving agent. Given an input camera image, describe the scene and provide a safe drivable trajectory. Output the trajectory after a <trajectory> token as a comma-separated list of [x,y,z] points.")
+    ap.add_argument("--trajectory-key", default="trajectory_ins", choices=["trajectory_ins", "trajectory_hmi", "trajectory_ins_past", "trajectory_hmi_past"])
+    ap.add_argument(
+        "--num-points",
+        type=int,
+        default=0,
+        help="How many trajectory points to output. 0 means use the full original trajectory.",
+    )
+    ap.add_argument("--relative-media", action="store_true")
+    ap.add_argument("--media-root", default="/home/work/datasets/bg/ORAD-3D")
+    ap.add_argument("--max-samples", type=int, default=None)
+    ap.add_argument("--max-per-seq", type=int, default=None)
+    ap.add_argument("--write-dataset-info", action="store_true")
+    ap.add_argument("--dataset-name", default="orad3d_vlm")
+
+    pref = ap.add_mutually_exclusive_group()
+    pref.add_argument("--kto", action="store_true", help="Emit KTO format (boolean feedback via kto_tag=true)")
+    pref.add_argument("--orpo", action="store_true", help="Emit ORPO/DPO ranking format (chosen/rejected)")
+
+    ap.add_argument(
+        "--min-heading-diff-deg",
+        type=float,
+        default=None,
+        help="Optional hard-negative constraint: require heading angle difference >= this (degrees), XY only.",
+    )
+    ap.add_argument(
+        "--max-delta-cosine",
+        type=float,
+        default=None,
+        help=(
+            "Optional hard-negative constraint: require cosine(similarity) between per-step XY deltas <= this. "
+            "Lower => more different turning/shape."
+        ),
+    )
+    ap.add_argument(
+        "--max-negative-tries",
+        type=int,
+        default=50,
+        help="How many attempts to find a wrong trajectory that satisfies constraints.",
+    )
+
+    ap.add_argument(
+        "--wrong-pool-size",
+        type=int,
+        default=256,
+        help="How many candidate wrong trajectories to sample per example (prevents global outlier dominating).",
+    )
+    ap.add_argument(
+        "--train-exclude-bottom-quantile",
+        type=float,
+        default=0.25,
+        help="Training split only: exclude the most-different bottom quantile by XY similarity when sampling negatives.",
+    )
+    ap.add_argument("--seed", type=int, default=0, help="Random seed for reproducible sampling")
+
+    ap.add_argument(
+        "--max-traj-similarity",
+        type=float,
+        default=0.5,
+        help="Maximum allowed XY trajectory similarity for negatives (lower => more different).",
+    )
+    ap.add_argument(
+        "--negative-policy",
+        choices=["most_different", "hard", "z_diff"],
+        default="z_diff",
+        help="How to pick the negative among candidates (z_diff selects by max mean |z| difference).",
+    )
+    ap.add_argument(
+        "--negative-source",
+        choices=["same_sequence", "global_pool", "hybrid"],
+        default="same_sequence",
+        help="Where to sample negatives from (same sequence is the scene-local default).",
+    )
+    ap.add_argument(
+        "--seq-window",
+        type=int,
+        default=10,
+        help="When using same_sequence/hybrid, sample negatives from +/- this many neighboring frames (ignored for z_diff).",
+    )
+    ap.add_argument(
+        "--allow-negative-fallback",
+        action="store_true",
+        help="If no negative satisfies constraints, fall back to the best available candidate instead of skipping.",
+    )
+    ap.add_argument(
+        "--min-z-diff",
+        type=float,
+        default=None,
+        help="Minimum mean absolute z difference required when using --negative-policy z_diff.",
+    )
+    ap.add_argument(
+        "--reject-z-flip",
+        action="store_true",
+        help="Create synthetic rejected trajectories by flipping z while keeping xy fixed (same scene).",
+    )
+    ap.add_argument(
+        "--reject-z-pivot",
+        choices=["start", "mean", "median"],
+        default="start",
+        help="Pivot used for z flipping (start keeps z0 unchanged).",
+    )
+    ap.add_argument(
+        "--reject-z-margin",
+        type=float,
+        default=0.0,
+        help="Extend clamp range for flipped z by this margin around per-trajectory z min/max.",
+    )
+    ap.add_argument(
+        "--reject-z-min-delta",
+        type=float,
+        default=1e-4,
+        help="Minimum max |delta z| required to accept a flipped reject.",
+    )
+
+    ap.add_argument(
+        "--no-tqdm",
+        action="store_true",
+        help="Disable tqdm progress bars.",
+    )
+
+    args = ap.parse_args()
+
+    random.seed(int(args.seed))
+
+    preference_format: Literal["none", "kto", "orpo"] = "none"
+    if args.kto:
+        preference_format = "kto"
+    elif args.orpo:
+        preference_format = "orpo"
+
+    out_dir = Path(args.out_dir) if args.out_dir else None
+    out_path = Path(args.out) if args.out else Path(".")
+    if out_dir is None and args.out is None:
+        raise SystemExit("[ERR] Provide either --out (single-file) or --out-dir (multi-split).")
+
+    opt = BuildOptions(
+        orad_root=Path(args.orad_root),
+        splits=tuple(args.splits),
+        out_path=out_path,
+        image_folder=args.image_folder,
+        prompt_text=args.prompt,
+        system_text=args.system,
+        trajectory_key=args.trajectory_key,
+        num_points=int(args.num_points),
+        relative_media=bool(args.relative_media),
+        media_root=Path(args.media_root),
+        max_samples=args.max_samples,
+        max_per_sequence=args.max_per_seq,
+        write_dataset_info=bool(args.write_dataset_info),
+        dataset_name=args.dataset_name,
+        preference_format=preference_format,
+        min_heading_diff_deg=args.min_heading_diff_deg,
+        max_delta_cosine=args.max_delta_cosine,
+        max_negative_tries=int(args.max_negative_tries),
+        wrong_pool_size=int(args.wrong_pool_size),
+        train_exclude_bottom_quantile=float(args.train_exclude_bottom_quantile),
+        seed=int(args.seed),
+        max_traj_similarity=float(args.max_traj_similarity) if args.max_traj_similarity is not None else None,
+        negative_policy=str(args.negative_policy),
+        negative_source=str(args.negative_source),
+        seq_window=int(args.seq_window),
+        allow_negative_fallback=bool(args.allow_negative_fallback),
+        min_z_diff=float(args.min_z_diff) if args.min_z_diff is not None else None,
+        reject_z_flip=bool(args.reject_z_flip),
+        reject_z_pivot=str(args.reject_z_pivot),
+        reject_z_margin=float(args.reject_z_margin),
+        reject_z_min_delta=float(args.reject_z_min_delta),
+        use_tqdm=(not bool(args.no_tqdm)) and bool(getattr(sys.stderr, "isatty", lambda: False)()),
+        out_dir=out_dir,
+        prefix=str(args.prefix),
+    )
+
+    # Multi-split mode: training -> ORPO, validation/testing -> ShareGPT.
+    if opt.out_dir is not None:
+        opt.out_dir.mkdir(parents=True, exist_ok=True)
+
+        written: list[str] = []
+        sharegpt_datasets: dict[str, str] = {}
+
+        for split in opt.splits:
+            if split == "training":
+                out_file = opt.out_dir / f"{opt.prefix}_training_orpo.jsonl"
+                opt_train = replace(opt, out_path=out_file, preference_format="orpo")
+                count = 0
+                with out_file.open("w", encoding="utf-8") as f:
+                    for sample in build_split_samples(opt_train, "training"):
+                        f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                        count += 1
+
+                written.append(f"{out_file} ({count} samples)")
+                if opt.write_dataset_info:
+                    _write_dataset_info(opt.out_dir, opt_train)
+
+            elif split in {"validation", "testing"}:
+                out_file = opt.out_dir / f"{opt.prefix}_{split}_sharegpt.jsonl"
+                opt_eval = replace(opt, out_path=out_file, preference_format="none")
+                count = 0
+                with out_file.open("w", encoding="utf-8") as f:
+                    for sample in build_split_samples(opt_eval, split):
+                        f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                        count += 1
+
+                written.append(f"{out_file} ({count} samples)")
+                sharegpt_datasets[f"{opt.dataset_name}_{split}"] = out_file.name
+
+        if opt.write_dataset_info and sharegpt_datasets:
+            _write_dataset_info_sharegpt_multi(opt.out_dir, sharegpt_datasets)
+
+        for line in written:
+            print(f"[OK] wrote {line}")
+        if opt.write_dataset_info:
+            if "training" in opt.splits:
+                print(f"[OK] wrote dataset_info_orpo.json -> {opt.out_dir / 'dataset_info_orpo.json'}")
+            if sharegpt_datasets:
+                print(f"[OK] wrote dataset_info.json -> {opt.out_dir / 'dataset_info.json'}")
+
+    else:
+        # Single-file mode (backward compatible)
+        opt.out_path.parent.mkdir(parents=True, exist_ok=True)
+        count = 0
+        with opt.out_path.open("w", encoding="utf-8") as f:
+            for sample in build_samples(opt):
+                f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                count += 1
+
+        if opt.write_dataset_info:
+            _write_dataset_info(opt.out_path.parent, opt)
+
+        mode = (
+            "ORPO ranking (chosen/rejected)"
+            if opt.preference_format == "orpo"
+            else "KTO (kto_tag)"
+            if opt.preference_format == "kto"
+            else "ShareGPT"
+        )
+        print(f"[OK] wrote {count} samples ({mode}) -> {opt.out_path}")
+        if opt.write_dataset_info:
+            print(f"[OK] wrote dataset_info.json -> {opt.out_path.parent / 'dataset_info.json'}")
+            if opt.preference_format == "orpo":
+                print(f"[OK] wrote dataset_info_orpo.json -> {opt.out_path.parent / 'dataset_info_orpo.json'}")
+
+        if count == 0:
+            print("[WARN] no samples were emitted. Check paths and extracted files.")
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

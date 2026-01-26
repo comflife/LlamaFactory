@@ -640,6 +640,23 @@
     "assistant_tag": "assistant",
     "system_tag": "system"
   }
+},"orad3d_orpo3": {
+  "file_name": "/home/work/datasets/bg/orad3d_orpo3/orad3d_train_orpo.jsonl",
+  "formatting": "sharegpt",
+  "ranking": true,
+  "columns": {
+    "messages": "messages",
+    "images": "images",
+    "chosen": "chosen",
+    "rejected": "rejected"
+  },
+  "tags": {
+    "role_tag": "role",
+    "content_tag": "content",
+    "user_tag": "user",
+    "assistant_tag": "assistant",
+    "system_tag": "system"
+  }
 },
   "orad3d_vlm_refine": {
     "file_name": "/home/work/datasets/bg/orad3d_vlm_refine/orad3d_all.jsonl",

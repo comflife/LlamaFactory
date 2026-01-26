@@ -15,15 +15,28 @@ Use --projection simple to fall back to the ego-plane scaling overlay.
 Example:
 python scripts/orad3d_compare_vlm_models_withz_eval_v4.py \
   --base-model Qwen/Qwen3-VL-2B-Instruct \
-  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-1044 \
-  --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_8/checkpoint-1044 \
-  --adapter orpo=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2/checkpoint-1044 \
+  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-3132 \
+  --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_8/checkpoint-3132 \
+  --adapter orpo=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/orpo2/checkpoint-3132 \
   --orad-root /home/work/datasets/bg/ORAD-3D \
   --split testing --image-folder image_data --num-samples 5 \
-  --out-dir /home/work/byounggun/LlamaFactory/orad3d_compare_models_withz \
+  --out-dir /home/work/byounggun/LlamaFactory/orad3d_compare_models_withz_final \
   --cache-dir /home/work/byounggun/.cache/hf \
   --use-sharegpt-format --temperature 1e-6 \
-  --hit-threshold 2.0 --frames-per-point 7 --auto-frames-per-point --failure-threshold 10.0
+  --hit-threshold 2.0 --frames-per-point 7 --auto-frames-per-point --failure-threshold 2.0
+
+
+python scripts/orad3d_compare_vlm_models_withz_eval_v4.py \
+  --base-model Qwen/Qwen3-VL-2B-Instruct \
+  --adapter sft_refine=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-3132 \
+  --adapter sft=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-3654 \
+  --adapter orpo=/home/work/datasets/bg/byounggun/saves/orad3d/qwen3-vl-2b/lora/sft_v2_refine/checkpoint-4176 \
+  --orad-root /home/work/datasets/bg/ORAD-3D \
+  --split testing --image-folder image_data --num-samples 5 \
+  --out-dir /home/work/byounggun/LlamaFactory/orad3d_compare_models_withz_final \
+  --cache-dir /home/work/byounggun/.cache/hf \
+  --use-sharegpt-format --temperature 1e-6 \
+  --hit-threshold 2.0 --frames-per-point 7 --auto-frames-per-point --failure-threshold 2.0
 """
 
 from __future__ import annotations
@@ -1160,11 +1173,7 @@ def _compute_pointwise_metrics(
     steps_per_sec = max(1, int(round(1.0 / step_sec)))
 
     if failure_threshold is not None:
-        end = min(n, steps_per_sec)
-        if end > 0:
-            metrics["failure_1s"] = 1.0 if max(dists[:end]) > failure_threshold else 0.0
-        else:
-            metrics["failure_1s"] = None
+        metrics["failure_1s"] = 1.0 if dists[-1] > failure_threshold else 0.0
 
     if horizons:
         for label, seconds in horizons:
@@ -2212,7 +2221,7 @@ def parse_args() -> argparse.Namespace:
         "--failure-threshold",
         type=float,
         default=10.0,
-        help="Failure threshold in meters for max L2 within the first second.",
+        help="Failure threshold in meters for L2 at the final point.",
     )
 
     ap.add_argument("--forward-axis", choices=["x", "y"], default="y")
