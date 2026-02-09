@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Run ORAD-3D inference for multiple LoRA adapters and save GT + predictions.
+"""Compare ORAD-3D adapters using saved manifests or optional inference.
 
-This version skips all composite rendering/metrics and writes per-adapter JSONL outputs.
-Each adapter gets its own folder (based on adapter name), and results are appended
-incrementally so the job can be resumed safely.
+By default this script loads per-adapter manifest.jsonl outputs and renders composite
+visualizations (image + XY plot panel + Z trend panel). Inference can be enabled with
+--run-inference, in which case per-adapter JSONL outputs are appended incrementally.
 
 Example:
 python scripts/orad3d_compare_vlm_models_withz_eval_v4.py \
@@ -1691,9 +1691,7 @@ def _render_model_panel(
     font = ImageFont.load_default()
 
     pad = 12
-    header_h = 26
-    draw.rectangle([(0, 0), (w, header_h)], fill=(245, 245, 245))
-    draw.text((pad, 6), header, fill=(0, 0, 0), font=font)
+    header_h = 0
 
     if not model_outputs:
         draw.text((pad, header_h + 10), "(no models)", fill=(0, 0, 0), font=font)
@@ -1704,28 +1702,15 @@ def _render_model_panel(
     rows = len(model_outputs)
     row_h = (h - y - pad - gap * (rows - 1)) / rows
 
-    def _wrap_lines(text: str, width_chars: int, max_lines: int) -> List[str]:
-        text = (text or "").strip()
-        if not text:
-            return []
-        lines: List[str] = []
-        for raw in text.splitlines():
-            raw = raw.strip()
-            if not raw:
-                continue
-            for line in textwrap.wrap(raw, width=width_chars, break_long_words=True, replace_whitespace=False):
-                if len(lines) >= max_lines:
-                    return lines
-                lines.append(line)
-        return lines
-
-    def _language_only(text: str) -> str:
-        if not text:
-            return ""
-        m = _TRAJ_TOKEN_RE.search(text)
-        if not m:
-            return text.strip()
-        return text[: m.start()].strip()
+    def _legend_label(name: str) -> str:
+        key = (name or "").strip().lower()
+        if key == "sft":
+            return "original"
+        if key in ("sft_refine", "sft-refine", "refine"):
+            return "new"
+        if key == "orpo":
+            return "orpo"
+        return name
 
     for output, color in model_outputs:
         name = output.name
@@ -1735,38 +1720,10 @@ def _render_model_panel(
         label_h = 16
 
         plot_pts = _align_pred_to_gt(pts, gt_points)
-        mean_l2 = _mean_l2(gt_points, plot_pts)
-        final_l2 = _final_l2(gt_points, plot_pts)
-        metrics: List[str] = []
-        if mean_l2 is not None:
-            metrics.append(f"mean_L2={mean_l2:.3f}")
-        if final_l2 is not None:
-            metrics.append(f"final_L2={final_l2:.3f}")
-
-        label = f"{name} ({', '.join(metrics)})" if metrics else name
+        label = _legend_label(name)
         draw.text((pad, row_top + 2), label, fill=color, font=font)
 
-        available_h = row_h - label_h - 6
-        max_text_lines = 0
-        if available_h >= 36:
-            max_text_lines = min(3, int(available_h // 12) - 1)
-        elif available_h >= 24:
-            max_text_lines = 1
-
-        text_lines: List[str] = []
-        if max_text_lines > 0:
-            max_chars = max(30, (w - 2 * pad) // 6)
-            lang_text = _language_only(output.output_text)
-            text_lines = _wrap_lines(lang_text, width_chars=max_chars, max_lines=max_text_lines)
-
-        if text_lines:
-            y_text = row_top + label_h
-            for line in text_lines:
-                draw.text((pad, y_text), line, fill=(60, 60, 60), font=font)
-                y_text += 12
-            plot_top = y_text + 4
-        else:
-            plot_top = row_top + label_h + 2
+        plot_top = row_top + label_h + 2
 
         if plot_top > row_bottom - 2:
             plot_top = row_bottom - 2
@@ -1806,6 +1763,7 @@ def _render_z_trend_panel(
     plot_box = (pad_left, pad_top, w - pad_right, h - pad_bottom)
     x0, y0, x1, y1 = plot_box
     draw.rectangle([x0, y0, x1, y1], outline=(180, 180, 180), width=1)
+    draw.text((x0 + 4, y0 - 12), "z", fill=(120, 120, 120), font=font)
 
     def _z_series(points: List[List[float]]) -> List[float]:
         if not points or len(points) < 2:
@@ -1820,9 +1778,19 @@ def _render_z_trend_panel(
                 out.append(float(p[2]) - z0)
         return out
 
+    def _legend_label(name: str) -> str:
+        key = (name or "").strip().lower()
+        if key == "sft":
+            return "original"
+        if key in ("sft_refine", "sft-refine", "refine"):
+            return "new"
+        if key == "orpo":
+            return "orpo"
+        return name
+
     series_data: List[Tuple[str, List[float], Tuple[int, int, int]]] = []
     for name, pts, color in series:
-        series_data.append((name, _z_series(pts), color))
+        series_data.append((_legend_label(name), _z_series(pts), color))
 
     all_z: List[float] = []
     for _, zs, _ in series_data:
@@ -1856,20 +1824,23 @@ def _render_z_trend_panel(
         y_zero = y1 - ((0.0 - z_min) / (z_max - z_min)) * usable_h
         draw.line([(x0, y_zero), (x1, y_zero)], fill=(220, 220, 220), width=1)
 
+    z_line_width = max(1, int(line_width) - 2)
     for name, zs, color in series_data:
         pts = _to_xy(zs)
         if len(pts) < 2:
             continue
         for a, b in zip(pts[:-1], pts[1:]):
-            draw.line([a, b], fill=color, width=max(1, int(line_width)))
+            draw.line([a, b], fill=color, width=z_line_width)
 
-    if show_gt_legend:
-        pad = 6
-        box_w = 38
-        box_h = 18
-        draw.rectangle([(pad, pad), (pad + box_w, pad + box_h)], fill=(255, 255, 255))
-        draw.rectangle([(pad, pad), (pad + box_w, pad + box_h)], outline=(200, 200, 200), width=1)
-        draw.text((pad + 4, pad + 2), "GT", fill=(0, 200, 0), font=font)
+    legend_x = x0 + 6
+    legend_y = y0 + 6
+    for name, _, color in series_data:
+        if name.upper() == "GT":
+            label = "GT"
+        else:
+            label = name
+        draw.text((legend_x, legend_y), label, fill=color, font=font)
+        legend_y += 10
 
     return img
 
@@ -1888,15 +1859,10 @@ def _make_composite(
 ) -> Image.Image:
     base = image.convert("RGB")
     overlay = base.copy()
-    draw = ImageDraw.Draw(overlay)
-    font = ImageFont.load_default()
-    bar_h = 40
-    draw.rectangle([(0, 0), (overlay.size[0], bar_h)], fill=(20, 20, 20))
-    draw.text((10, 6), header, fill=(255, 255, 255), font=font)
 
     panel = _render_model_panel(
         size=(panel_width, overlay.size[1]),
-        header="Model comparison",
+        header="",
         gt_points=gt_points,
         model_outputs=model_outputs,
         forward_axis=forward_axis,
@@ -2101,52 +2067,76 @@ def _render_triplet_outputs(
     calib: Optional[Calib],
 ) -> None:
     key_stem = _safe_file_stem(item.key)
-    overlay = _render_overlay_multimodel(
-        image=base_image,
-        gt_points=gt_points,
-        model_points=model_points,
-        forward_axis=forward_axis,
-        flip_lateral=flip_lateral,
-        line_width=line_width,
-        calib=calib,
-        scale_xy=scale_xy,
-        show_gt_legend=False,
-    )
-    overlay_path = stage_dir / f"{key_stem}_image.png"
-    overlay.save(overlay_path)
-
     panel_width = max(260, int(panel_width))
-    xy_panel = _render_xy_plot_panel(
-        size=(panel_width, base_image.size[1]),
-        series=[("GT", gt_points, (0, 200, 0))] + [
-            (name, pts, color) for name, pts, color in model_points
-        ],
+    comp = _make_composite(
+        image=base_image,
+        header=item.key,
+        gt_points=gt_points,
+        model_outputs=model_outputs,
         forward_axis=forward_axis,
         flip_lateral=flip_lateral,
-        line_width=line_width,
-        show_gt_legend=False,
+        panel_width=panel_width,
+        line_width=int(line_width),
+        calib=calib,
     )
-    panel_path = stage_dir / f"{key_stem}_xy.png"
-    xy_panel.save(panel_path)
-
-    z_panel_w = max(base_image.size[0], panel_width)
-    z_panel_h = max(140, int(base_image.size[1] // 4))
-    z_series = [("GT", gt_points, (0, 200, 0))]
-    z_series.extend([(name, pts, color) for name, pts, color in model_points])
-    z_panel = _render_z_trend_panel(
-        size=(z_panel_w, z_panel_h),
-        series=z_series,
-        line_width=line_width,
-        show_gt_legend=False,
-    )
-    z_path = stage_dir / f"{key_stem}_z.png"
-    z_panel.save(z_path)
+    comp_path = stage_dir / f"{key_stem}.png"
+    comp.save(comp_path)
 
     for output, _ in model_outputs:
         text = _language_only_text(output.output_text)
         out_name = _safe_file_stem(output.name)
         txt_path = stage_dir / f"{key_stem}_{out_name}.txt"
         txt_path.write_text(text, encoding="utf-8")
+
+
+def _render_stage_item(
+    *,
+    stage_dir: Path,
+    item: SampleItem,
+    first_out: ModelOutput,
+    first_color: Tuple[int, int, int],
+    second_out: ModelOutput,
+    second_color: Tuple[int, int, int],
+    args: argparse.Namespace,
+    orad_root: Optional[Path],
+) -> bool:
+    try:
+        raw_image = Image.open(item.image_path).convert("RGB")
+    except Exception:
+        return False
+
+    display_image, scale_xy = _resize_for_display(raw_image, int(args.max_image_size))
+
+    calib = None
+    if args.projection == "calib":
+        seq_dir = _infer_seq_dir_for_item(item, orad_root=orad_root)
+        ts = str(item.meta.get("timestamp") or item.image_path.stem)
+        if seq_dir is not None and ts:
+            calib = _load_calib(seq_dir, ts)
+
+    model_points = [
+        (first_out.name, first_out.trajectory_points, first_color),
+        (second_out.name, second_out.trajectory_points, second_color),
+    ]
+    model_outputs = [
+        (first_out, first_color),
+        (second_out, second_color),
+    ]
+    _render_triplet_outputs(
+        stage_dir=stage_dir,
+        item=item,
+        base_image=display_image,
+        scale_xy=scale_xy,
+        gt_points=item.gt_points,
+        model_points=model_points,
+        model_outputs=model_outputs,
+        forward_axis=args.forward_axis,
+        flip_lateral=bool(args.flip_lateral),
+        line_width=int(args.line_width),
+        panel_width=int(args.panel_width),
+        calib=calib,
+    )
+    return True
 
 
 def _parse_adapter_specs(values: Sequence[str]) -> List[AdapterSpec]:
@@ -2439,6 +2429,18 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--top-p", type=float, default=0.9)
     ap.add_argument("--skip-special-tokens", action="store_true")
 
+    ap.add_argument(
+        "--saved-root",
+        type=Path,
+        default=Path("/home/bg/LlamaFactory/orad3d_adapter_save_local"),
+        help="Root directory containing per-adapter manifest.jsonl outputs.",
+    )
+    ap.add_argument(
+        "--run-inference",
+        action="store_true",
+        help="Load models and generate outputs instead of using --saved-root manifests.",
+    )
+
     ap.add_argument("--debug-save-skipped", action="store_true")
     ap.add_argument("--debug-print-skipped", action="store_true")
 
@@ -2572,133 +2574,93 @@ def main() -> int:
     if not items:
         raise SystemExit("No samples with valid GT trajectories found.")
 
-    for adapter in adapters:
-        print(f"[LOAD] {adapter.name} -> {adapter.path}")
-        name, written, skipped, manifest_path = _run_inference_for_adapter(adapter=adapter, items=items, args=args)
-        print(f"[DONE {name}] {written} new, {skipped} skipped -> {manifest_path}")
-
-    results_by_model = _load_results_by_model(adapters, args.out_dir)
+    if args.run_inference:
+        for adapter in adapters:
+            print(f"[LOAD] {adapter.name} -> {adapter.path}")
+            name, written, skipped, manifest_path = _run_inference_for_adapter(adapter=adapter, items=items, args=args)
+            print(f"[DONE {name}] {written} new, {skipped} skipped -> {manifest_path}")
+        results_by_model = _load_results_by_model(adapters, args.out_dir)
+    else:
+        saved_root = Path(args.saved_root)
+        if not saved_root.is_dir():
+            raise SystemExit(f"Saved root not found: {saved_root}")
+        print(f"[LOAD] Using saved manifests from {saved_root}")
+        results_by_model = _load_results_by_model(adapters, saved_root)
     sft_adapter = _get_adapter(adapters, args.sft_name)
     refine_adapter = _get_adapter(adapters, args.refine_name)
     orpo_adapter = _get_adapter(adapters, args.orpo_name)
 
     max_viz = int(args.max_visualizations) if int(args.max_visualizations) > 0 else None
 
-    stage1_dir = args.out_dir / "viz_sft_refine"
-    stage1_dir.mkdir(parents=True, exist_ok=True)
-    stage1_count = 0
+    stage1_items: List[SampleItem] = []
+    stage2_items: List[SampleItem] = []
     for item in items:
         sft_out = results_by_model.get(sft_adapter.name, {}).get(item.key)
         refine_out = results_by_model.get(refine_adapter.name, {}).get(item.key)
-        if sft_out is None or refine_out is None:
-            continue
-        if not sft_out.valid or not refine_out.valid:
-            continue
-        sft_xy = _mean_xy_error(sft_out.trajectory_points, item.gt_points)
-        refine_xy = _mean_xy_error(refine_out.trajectory_points, item.gt_points)
-        if sft_xy is None or refine_xy is None:
-            continue
-        if refine_xy >= sft_xy:
-            continue
+        if sft_out is not None and refine_out is not None and sft_out.valid and refine_out.valid:
+            sft_xy = _mean_xy_error(sft_out.trajectory_points, item.gt_points)
+            refine_xy = _mean_xy_error(refine_out.trajectory_points, item.gt_points)
+            if sft_xy is not None and refine_xy is not None and refine_xy < sft_xy:
+                stage1_items.append(item)
 
-        try:
-            raw_image = Image.open(item.image_path).convert("RGB")
-        except Exception:
-            continue
+        orpo_out = results_by_model.get(orpo_adapter.name, {}).get(item.key)
+        if refine_out is not None and orpo_out is not None and refine_out.valid and orpo_out.valid:
+            refine_xy = _mean_xy_error(refine_out.trajectory_points, item.gt_points)
+            orpo_xy = _mean_xy_error(orpo_out.trajectory_points, item.gt_points)
+            refine_z = _mean_z_error(refine_out.trajectory_points, item.gt_points)
+            orpo_z = _mean_z_error(orpo_out.trajectory_points, item.gt_points)
+            if (
+                refine_xy is not None
+                and orpo_xy is not None
+                and refine_z is not None
+                and orpo_z is not None
+                and orpo_xy < refine_xy
+                and orpo_z < refine_z
+            ):
+                stage2_items.append(item)
 
-        display_image, scale_xy = _resize_for_display(raw_image, int(args.max_image_size))
-
-        calib = None
-        if args.projection == "calib":
-            seq_dir = _infer_seq_dir_for_item(item, orad_root=args.orad_root)
-            ts = str(item.meta.get("timestamp") or item.image_path.stem)
-            if seq_dir is not None and ts:
-                calib = _load_calib(seq_dir, ts)
-
-        model_points = [
-            (sft_out.name, sft_out.trajectory_points, sft_adapter.color),
-            (refine_out.name, refine_out.trajectory_points, refine_adapter.color),
-        ]
-        model_outputs = [
-            (sft_out, sft_adapter.color),
-            (refine_out, refine_adapter.color),
-        ]
-        _render_triplet_outputs(
-            stage_dir=stage1_dir,
-            item=item,
-            base_image=display_image,
-            scale_xy=scale_xy,
-            gt_points=item.gt_points,
-            model_points=model_points,
-            model_outputs=model_outputs,
-            forward_axis=args.forward_axis,
-            flip_lateral=bool(args.flip_lateral),
-            line_width=int(args.line_width),
-            panel_width=int(args.panel_width),
-            calib=calib,
-        )
-        stage1_count += 1
-        if max_viz is not None and stage1_count >= max_viz:
-            break
-
+    stage1_dir = args.out_dir / "viz_sft_refine"
+    stage1_dir.mkdir(parents=True, exist_ok=True)
     stage2_dir = args.out_dir / "viz_refine_orpo"
     stage2_dir.mkdir(parents=True, exist_ok=True)
+
+    stage1_count = 0
     stage2_count = 0
-    for item in items:
-        refine_out = results_by_model.get(refine_adapter.name, {}).get(item.key)
-        orpo_out = results_by_model.get(orpo_adapter.name, {}).get(item.key)
-        if refine_out is None or orpo_out is None:
-            continue
-        if not refine_out.valid or not orpo_out.valid:
-            continue
-        refine_xy = _mean_xy_error(refine_out.trajectory_points, item.gt_points)
-        orpo_xy = _mean_xy_error(orpo_out.trajectory_points, item.gt_points)
-        refine_z = _mean_z_error(refine_out.trajectory_points, item.gt_points)
-        orpo_z = _mean_z_error(orpo_out.trajectory_points, item.gt_points)
-        if refine_xy is None or orpo_xy is None or refine_z is None or orpo_z is None:
-            continue
-        if not (orpo_xy < refine_xy and orpo_z < refine_z):
-            continue
+    max_len = max(len(stage1_items), len(stage2_items))
+    for i in range(max_len):
+        if i < len(stage1_items) and (max_viz is None or stage1_count < max_viz):
+            item = stage1_items[i]
+            sft_out = results_by_model.get(sft_adapter.name, {}).get(item.key)
+            refine_out = results_by_model.get(refine_adapter.name, {}).get(item.key)
+            if sft_out is not None and refine_out is not None:
+                if _render_stage_item(
+                    stage_dir=stage1_dir,
+                    item=item,
+                    first_out=sft_out,
+                    first_color=sft_adapter.color,
+                    second_out=refine_out,
+                    second_color=refine_adapter.color,
+                    args=args,
+                    orad_root=args.orad_root,
+                ):
+                    stage1_count += 1
 
-        try:
-            raw_image = Image.open(item.image_path).convert("RGB")
-        except Exception:
-            continue
-
-        display_image, scale_xy = _resize_for_display(raw_image, int(args.max_image_size))
-
-        calib = None
-        if args.projection == "calib":
-            seq_dir = _infer_seq_dir_for_item(item, orad_root=args.orad_root)
-            ts = str(item.meta.get("timestamp") or item.image_path.stem)
-            if seq_dir is not None and ts:
-                calib = _load_calib(seq_dir, ts)
-
-        model_points = [
-            (refine_out.name, refine_out.trajectory_points, refine_adapter.color),
-            (orpo_out.name, orpo_out.trajectory_points, orpo_adapter.color),
-        ]
-        model_outputs = [
-            (refine_out, refine_adapter.color),
-            (orpo_out, orpo_adapter.color),
-        ]
-        _render_triplet_outputs(
-            stage_dir=stage2_dir,
-            item=item,
-            base_image=display_image,
-            scale_xy=scale_xy,
-            gt_points=item.gt_points,
-            model_points=model_points,
-            model_outputs=model_outputs,
-            forward_axis=args.forward_axis,
-            flip_lateral=bool(args.flip_lateral),
-            line_width=int(args.line_width),
-            panel_width=int(args.panel_width),
-            calib=calib,
-        )
-        stage2_count += 1
-        if max_viz is not None and stage2_count >= max_viz:
-            break
+        if i < len(stage2_items) and (max_viz is None or stage2_count < max_viz):
+            item = stage2_items[i]
+            refine_out = results_by_model.get(refine_adapter.name, {}).get(item.key)
+            orpo_out = results_by_model.get(orpo_adapter.name, {}).get(item.key)
+            if refine_out is not None and orpo_out is not None:
+                if _render_stage_item(
+                    stage_dir=stage2_dir,
+                    item=item,
+                    first_out=refine_out,
+                    first_color=refine_adapter.color,
+                    second_out=orpo_out,
+                    second_color=orpo_adapter.color,
+                    args=args,
+                    orad_root=args.orad_root,
+                ):
+                    stage2_count += 1
 
     print(
         f"[DONE] wrote per-adapter manifests -> {args.out_dir} | "

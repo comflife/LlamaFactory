@@ -37,6 +37,18 @@ python scripts/orad3d_compare_vlm_models_withz_eval_v4.py \
   --cache-dir /home/work/byounggun/.cache/hf \
   --use-sharegpt-format --temperature 1e-6 \
   --hit-threshold 2.0 --frames-per-point 7 --auto-frames-per-point --failure-threshold 2.0
+
+python scripts/orad3d_compare_vlm_models_withz_eval_v4.py \
+  --base-model Qwen/Qwen3-VL-2B-Instruct \
+  --adapter sft_refine=/media/bg/my2tb/models/sft_v2_refine/checkpoint-3654 \
+  --adapter sft=/media/bg/my2tb/models/sft_v2_8/checkpoint-3654 \
+  --adapter orpo=/media/bg/my2tb/models/orpo2/checkpoint-3654 \
+  --orad-root /media/bg/my2tb/ORAD-3D \
+  --split testing --image-folder image_data --num-samples 5 \
+  --out-dir /home/bg/LlamaFactory/orad3d_compare_models_withz_local \
+  --cache-dir /home/bg/.cache/hf \
+  --use-sharegpt-format --temperature 1e-6 \
+  --hit-threshold 2.0 --frames-per-point 7 --auto-frames-per-point --failure-threshold 2.0
 """
 
 from __future__ import annotations
